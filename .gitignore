@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Model weights (large files — download separately)
+*.pt
+*.pth
+*.onnx
+
+# Experiment outputs
+experiments/
+replay_buffer.jsonl
+
+# Test / scratch images
+test_image.*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store

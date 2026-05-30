@@ -1,0 +1,10 @@
+ultralytics>=8.0
+opencv-python>=4.8
+numpy>=1.24
+supervision>=0.18
+lapx
+scipy
+pyyaml
+rich
+pandas
+PyQt5
