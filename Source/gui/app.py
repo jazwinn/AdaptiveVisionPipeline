@@ -1,8 +1,5 @@
 """
-GUI entry point for the Adaptive Vision Pipeline.
-
-Usage:
-    python gui.py
+GUI application for the Adaptive Vision Pipeline.
 """
 from __future__ import annotations
 
@@ -13,21 +10,21 @@ from pathlib import Path
 
 # torch / ultralytics must be imported before PyQt5 on Windows to avoid DLL
 # initialization conflicts caused by Qt loading its own CRT first.
-from drone_detect.core.config import RunConfig, RuntimeConfig
-from drone_detect.core.frame_reader import FrameReader
-from drone_detect.core.pipeline import Detection
-from drone_detect.pipelines.pipeline_a import PipelineA
-from drone_detect.pipelines.pipeline_b import PipelineB
-from drone_detect.pipelines.pipeline_c import PipelineC
-from drone_detect.pipelines.pipeline_d import PipelineD
-from drone_detect.features.extractor import FeatureExtractor
-from drone_detect.tracking.tracker import TrackerWrapper
-from drone_detect.controller.rule_based import RuleBasedController
-from drone_detect.controller.bandit import UCBBanditController, ContextualBanditController
-from drone_detect.controller.orchestrator import PipelineOrchestrator
-from drone_detect.evaluation.metrics import WindowMetrics, compute_reward
-from drone_detect.evaluation.replay_buffer import ReplayBuffer
-from drone_detect.experiments.logger import ExperimentLogger
+from ..core.config import RunConfig, RuntimeConfig
+from ..core.frame_reader import FrameReader
+from ..core.pipeline import Detection
+from ..pipelines.pipeline_a import PipelineA
+from ..pipelines.pipeline_b import PipelineB
+from ..pipelines.pipeline_c import PipelineC
+from ..pipelines.pipeline_d import PipelineD
+from ..features.extractor import FeatureExtractor
+from ..tracking.tracker import TrackerWrapper
+from ..controller.rule_based import RuleBasedController
+from ..controller.bandit import UCBBanditController, ContextualBanditController
+from ..controller.orchestrator import PipelineOrchestrator
+from ..evaluation.metrics import WindowMetrics, compute_reward
+from ..evaluation.replay_buffer import ReplayBuffer
+from ..experiments.logger import ExperimentLogger
 
 import cv2
 import numpy as np
@@ -179,7 +176,6 @@ class PipelineWorker(QThread):
         latency_history: deque[float] = deque(maxlen=30)
         last_reward = 0.0
 
-        # Output setup (mirrors run.py logic)
         out_writer = None
         out_dir = None
         out_image_path = None
@@ -579,7 +575,6 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
 
-    # Dark palette so OS chrome (scrollbars, tooltips) matches the panel
     palette = QPalette()
     palette.setColor(QPalette.Window, QColor(30, 30, 30))
     palette.setColor(QPalette.WindowText, QColor(220, 220, 220))
@@ -595,7 +590,3 @@ def main():
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
-
-
-if __name__ == "__main__":
-    main()

@@ -1,2 +1,0 @@
-@echo off
-python -c "from PIL import Image; img = Image.open(r'C:\Users\ngjaz\AppData\Roaming\Claude\local-agent-mode-sessions\d08c12ba-7a93-4ca0-8d10-b5b3c8090aec\02b8d970-102f-4cac-8d72-28e2ef8ac78c\agent\local_ditto_02b8d970-102f-4cac-8d72-28e2ef8ac78c\outputs\screenshot-1780124415566.jpg'); img.save(r'C:\Users\ngjaz\AppData\Roaming\Claude\local-agent-mode-sessions\d08c12ba-7a93-4ca0-8d10-b5b3c8090aec\02b8d970-102f-4cac-8d72-28e2ef8ac78c\agent\local_ditto_02b8d970-102f-4cac-8d72-28e2ef8ac78c\outputs\gui_screenshot.png'); print('Done')"
