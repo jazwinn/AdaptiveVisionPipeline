@@ -25,6 +25,10 @@ from ..controller.decision_tree import DecisionTreeController, RandomForestContr
 from ..controller.orchestrator import PipelineOrchestrator
 from ..evaluation.metrics import WindowMetrics, compute_reward
 from ..evaluation.replay_buffer import ReplayBuffer
+from ..evaluation.benchmark import (
+    BenchmarkResult, PerWindowRecord,
+    build_pipelines, build_controllers, run_controller, write_csv,
+)
 from ..experiments.logger import ExperimentLogger
 
 import cv2
@@ -35,7 +39,8 @@ from PyQt5.QtGui import QImage, QPixmap, QPalette, QColor
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QRadioButton, QSizePolicy, QSlider, QSpinBox, QVBoxLayout,
+    QProgressBar, QRadioButton, QSizePolicy, QSlider, QSpinBox,
+    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget, QFrame,
 )
 
@@ -280,6 +285,350 @@ class PipelineWorker(QThread):
                 logger.save()
 
 
+# ── Benchmark worker ─────────────────────────────────────────────────────────
+
+class BenchmarkWorker(QThread):
+    controller_done = pyqtSignal(object)          # BenchmarkResult
+    progress        = pyqtSignal(str, int)        # (status_text, pct 0-100)
+    finished_all    = pyqtSignal(object, object)  # (list[BenchmarkResult], list[PerWindowRecord])
+    error           = pyqtSignal(str)
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self.cfg = cfg
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        try:
+            self._run()
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+    def _run(self):
+        cfg = self.cfg
+        pipelines = build_pipelines(
+            conf=cfg["conf"],
+            include_heavy=cfg["include_heavy"],
+        )
+        pipeline_names = [p.name for p in pipelines]
+
+        controllers, warns = build_controllers(cfg["selected"], pipeline_names)
+        for w in warns:
+            self.progress.emit(f"⚠ {w}", 0)
+
+        all_results: list[BenchmarkResult] = []
+        all_records: list[PerWindowRecord] = []
+        n_total = len(controllers)
+
+        for idx, (name, ctrl) in enumerate(controllers):
+            if self._stop.is_set():
+                break
+            self.progress.emit(f"Running {name}… ({idx + 1}/{n_total})", int(idx / n_total * 100))
+
+            def _cb(ctrl_name: str, frame_idx: int, _name=name):
+                self.progress.emit(f"Running {_name}… frame {frame_idx}", int((_name and 0) or 0))
+
+            result, records = run_controller(
+                cfg["source"], ctrl, pipelines, cfg["window"],
+                progress_cb=_cb,
+            )
+            # Overwrite controller_name with the short label used in the GUI
+            result.controller_name = name
+            for rec in records:
+                rec.controller_name = name
+
+            all_results.append(result)
+            all_records.extend(records)
+            self.controller_done.emit(result)
+
+        self.progress.emit("Done", 100)
+        self.finished_all.emit(all_results, all_records)
+
+
+# ── Benchmark widget ──────────────────────────────────────────────────────────
+
+_TABLE_COLS = [
+    "Controller", "Mean Reward", "Std", "Min", "Max",
+    "Latency (ms)", "P95 (ms)", "Switches", "Top Pipeline",
+]
+
+_DIST_PIPELINES = ["fast_baseline", "clahe_pipeline", "tiled", "high_res"]
+
+_TBL_STYLE = (
+    "QTableWidget {"
+    "  background-color: #1e1e1e; color: #e0e0e0;"
+    "  gridline-color: #3a3a3a; border: none;"
+    "}"
+    "QTableWidget::item { padding: 4px 8px; }"
+    "QHeaderView::section {"
+    "  background-color: #2b2b2b; color: #aaa;"
+    "  border: none; padding: 4px 8px; font-weight: bold;"
+    "}"
+)
+
+
+class BenchmarkWidget(QWidget):
+    def __init__(self, source_getter):
+        """
+        Parameters
+        ----------
+        source_getter : callable() → str
+            Returns the source path from the main panel's SOURCE field.
+        """
+        super().__init__()
+        self._source_getter = source_getter
+        self._worker: BenchmarkWorker | None = None
+        self._all_records: list[PerWindowRecord] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Left control strip ────────────────────────────────────────────────
+        ctrl_panel = QWidget()
+        ctrl_panel.setFixedWidth(210)
+        ctrl_panel.setStyleSheet(_PANEL)
+        v = QVBoxLayout(ctrl_panel)
+        v.setContentsMargins(12, 14, 12, 14)
+        v.setSpacing(0)
+
+        v.addWidget(_cap("CONTROLLERS"))
+        v.addSpacing(4)
+        self._chk_controllers: dict[str, QCheckBox] = {}
+        for name in ("rule", "ucb", "contextual", "decision_tree", "random_forest"):
+            chk = QCheckBox(name)
+            chk.setChecked(True)
+            chk.setStyleSheet(_CHECK)
+            v.addWidget(chk)
+            self._chk_controllers[name] = chk
+        v.addSpacing(14)
+
+        v.addWidget(_divider())
+        v.addSpacing(10)
+        v.addWidget(_cap("WINDOW SIZE (frames)"))
+        v.addSpacing(4)
+        self._window_spin = QSpinBox()
+        self._window_spin.setRange(1, 500)
+        self._window_spin.setValue(30)
+        self._window_spin.setStyleSheet(_INPUT)
+        v.addWidget(self._window_spin)
+        v.addSpacing(10)
+
+        self._chk_heavy = QCheckBox("Include heavy (YOLOv8m)")
+        self._chk_heavy.setStyleSheet(_CHECK)
+        v.addWidget(self._chk_heavy)
+        v.addSpacing(14)
+
+        v.addWidget(_divider())
+        v.addSpacing(10)
+        self._run_btn = QPushButton("RUN BENCHMARK")
+        self._run_btn.setStyleSheet(_BTN_START)
+        self._run_btn.clicked.connect(self._on_run)
+        v.addWidget(self._run_btn)
+        v.addSpacing(6)
+        self._save_btn = QPushButton("SAVE CSV")
+        self._save_btn.setStyleSheet(_BTN_SMALL)
+        self._save_btn.setEnabled(False)
+        self._save_btn.clicked.connect(self._on_save_csv)
+        v.addWidget(self._save_btn)
+        v.addSpacing(10)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(False)
+        self._progress_bar.setStyleSheet(
+            "QProgressBar { background: #3c3c3c; border: none; border-radius: 3px; height: 8px; }"
+            "QProgressBar::chunk { background: #4a90d9; border-radius: 3px; }"
+        )
+        v.addWidget(self._progress_bar)
+        v.addSpacing(4)
+
+        self._status_lbl = QLabel("Ready")
+        self._status_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        self._status_lbl.setWordWrap(True)
+        v.addWidget(self._status_lbl)
+
+        v.addStretch()
+        root.addWidget(ctrl_panel)
+
+        # ── Right: tables ─────────────────────────────────────────────────────
+        right = QWidget()
+        right.setStyleSheet("background-color: #1a1a1a;")
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(10, 10, 10, 10)
+        rv.setSpacing(6)
+
+        summary_lbl = QLabel("Summary")
+        summary_lbl.setStyleSheet("color: #aaa; font-size: 11px; font-weight: bold; letter-spacing: 1px;")
+        rv.addWidget(summary_lbl)
+
+        self._summary_table = QTableWidget(0, len(_TABLE_COLS))
+        self._summary_table.setHorizontalHeaderLabels(_TABLE_COLS)
+        self._summary_table.setStyleSheet(_TBL_STYLE)
+        self._summary_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._summary_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._summary_table.horizontalHeader().setStretchLastSection(True)
+        self._summary_table.verticalHeader().setVisible(False)
+        rv.addWidget(self._summary_table, stretch=3)
+
+        dist_lbl = QLabel("Pipeline Distribution (% of windows)")
+        dist_lbl.setStyleSheet("color: #aaa; font-size: 11px; font-weight: bold; letter-spacing: 1px;")
+        rv.addWidget(dist_lbl)
+
+        dist_cols = ["Controller"] + _DIST_PIPELINES
+        self._dist_table = QTableWidget(0, len(dist_cols))
+        self._dist_table.setHorizontalHeaderLabels(dist_cols)
+        self._dist_table.setStyleSheet(_TBL_STYLE)
+        self._dist_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._dist_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._dist_table.horizontalHeader().setStretchLastSection(True)
+        self._dist_table.verticalHeader().setVisible(False)
+        rv.addWidget(self._dist_table, stretch=2)
+
+        root.addWidget(right)
+
+    # ── Slots ──────────────────────────────────────────────────────────────────
+
+    def _on_run(self):
+        source = self._source_getter()
+        if not source:
+            QMessageBox.warning(self, "No source", "Enter a source path in the SOURCE field first.")
+            return
+
+        selected = [name for name, chk in self._chk_controllers.items() if chk.isChecked()]
+        if not selected:
+            QMessageBox.warning(self, "No controllers", "Select at least one controller.")
+            return
+
+        # Clear tables
+        self._summary_table.setRowCount(0)
+        self._dist_table.setRowCount(0)
+        self._all_records = []
+        self._save_btn.setEnabled(False)
+
+        cfg = {
+            "source":        source,
+            "conf":          0.30,
+            "window":        self._window_spin.value(),
+            "include_heavy": self._chk_heavy.isChecked(),
+            "selected":      selected,
+        }
+
+        self._worker = BenchmarkWorker(cfg)
+        self._worker.controller_done.connect(self._on_controller_done)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished_all.connect(self._on_finished)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+        self._run_btn.setEnabled(False)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(True)
+
+    def _on_progress(self, text: str, pct: int):
+        self._status_lbl.setText(text)
+        if pct > 0:
+            self._progress_bar.setValue(pct)
+
+    def _on_controller_done(self, result: BenchmarkResult):
+        self._add_summary_row(result)
+        self._add_dist_row(result)
+        self._colour_best_reward()
+
+    def _on_finished(self, results, records):
+        self._all_records = records
+        self._run_btn.setEnabled(True)
+        self._progress_bar.setVisible(False)
+        self._save_btn.setEnabled(bool(records))
+        self._status_lbl.setText(f"Done — {len(results)} controller(s) benchmarked.")
+
+    def _on_error(self, msg: str):
+        self._run_btn.setEnabled(True)
+        self._progress_bar.setVisible(False)
+        QMessageBox.critical(self, "Benchmark error", msg)
+
+    def _on_save_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save benchmark CSV", "", "CSV (*.csv);;All (*)"
+        )
+        if path:
+            write_csv(self._all_records, path)
+            self._status_lbl.setText(f"Saved → {Path(path).name}")
+
+    # ── Table helpers ──────────────────────────────────────────────────────────
+
+    def _add_summary_row(self, r: BenchmarkResult):
+        tbl = self._summary_table
+        row = tbl.rowCount()
+        tbl.insertRow(row)
+
+        if r.pipeline_distribution:
+            top_key = max(r.pipeline_distribution, key=r.pipeline_distribution.get)
+            top_str = f"{top_key} ({r.pipeline_distribution[top_key] * 100:.0f}%)"
+        else:
+            top_str = "N/A"
+
+        values = [
+            r.controller_name,
+            f"{r.mean_reward:.3f}",
+            f"{r.std_reward:.3f}",
+            f"{r.min_reward:.3f}",
+            f"{r.max_reward:.3f}",
+            f"{r.mean_latency_ms:.1f}",
+            f"{r.p95_latency_ms:.1f}",
+            str(r.total_switches),
+            top_str,
+        ]
+        for col, val in enumerate(values):
+            item = QTableWidgetItem(val)
+            item.setTextAlignment(Qt.AlignCenter)
+            tbl.setItem(row, col, item)
+
+    def _add_dist_row(self, r: BenchmarkResult):
+        tbl = self._dist_table
+        row = tbl.rowCount()
+        tbl.insertRow(row)
+        tbl.setItem(row, 0, QTableWidgetItem(r.controller_name))
+        for col, p_name in enumerate(_DIST_PIPELINES, start=1):
+            pct = r.pipeline_distribution.get(p_name, 0.0) * 100
+            item = QTableWidgetItem(f"{pct:.0f}%")
+            item.setTextAlignment(Qt.AlignCenter)
+            tbl.setItem(row, col, item)
+
+    def _colour_best_reward(self):
+        """Highlight best mean reward green, worst red in the summary table."""
+        tbl = self._summary_table
+        n = tbl.rowCount()
+        if n < 2:
+            return
+        rewards = []
+        for row in range(n):
+            item = tbl.item(row, 1)
+            try:
+                rewards.append(float(item.text()))
+            except (ValueError, AttributeError):
+                rewards.append(0.0)
+        best = max(rewards)
+        worst = min(rewards)
+        for row, val in enumerate(rewards):
+            item = tbl.item(row, 1)
+            if item is None:
+                continue
+            if val == best:
+                item.setBackground(QColor(40, 90, 50))
+            elif val == worst:
+                item.setBackground(QColor(90, 40, 40))
+            else:
+                item.setBackground(QColor(30, 30, 30))
+
+
 # ── Video display widget ──────────────────────────────────────────────────────
 
 class VideoLabel(QLabel):
@@ -318,7 +667,23 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         root.addWidget(self._build_panel())
-        root.addWidget(self._build_video_area())
+
+        # ── Right side: tabs (Live preview + Benchmark) ───────────────────────
+        tabs = QTabWidget()
+        tabs.setStyleSheet(
+            "QTabWidget::pane { border: none; background: #111; }"
+            "QTabBar::tab { background: #2b2b2b; color: #aaa; padding: 7px 18px;"
+            "  border: none; font-size: 12px; }"
+            "QTabBar::tab:selected { background: #1a1a1a; color: #fff; }"
+            "QTabBar::tab:hover { background: #333; }"
+        )
+        tabs.addTab(self._build_video_area(), "▶  Live")
+        tabs.addTab(
+            BenchmarkWidget(lambda: self.source_edit.text().strip()),
+            "📊  Benchmark",
+        )
+        root.addWidget(tabs)
+
         self._build_status_bar()
 
     # ── Left control panel ────────────────────────────────────────────────────
