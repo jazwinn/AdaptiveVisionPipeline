@@ -17,6 +17,7 @@ replay_buffer.jsonl
 
 # Test / scratch images
 test_image.*
+.coco
 
 # IDE
 .vscode/

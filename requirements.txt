@@ -8,3 +8,4 @@ pyyaml
 rich
 pandas
 PyQt5
+scikit-learn

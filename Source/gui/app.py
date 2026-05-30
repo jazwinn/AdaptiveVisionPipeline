@@ -21,6 +21,7 @@ from ..features.extractor import FeatureExtractor
 from ..tracking.tracker import TrackerWrapper
 from ..controller.rule_based import RuleBasedController
 from ..controller.bandit import UCBBanditController, ContextualBanditController
+from ..controller.decision_tree import DecisionTreeController, RandomForestController
 from ..controller.orchestrator import PipelineOrchestrator
 from ..evaluation.metrics import WindowMetrics, compute_reward
 from ..evaluation.replay_buffer import ReplayBuffer
@@ -91,16 +92,6 @@ def _divider() -> QFrame:
     return line
 
 
-def _dets_to_sv(dets: list[Detection]) -> sv.Detections:
-    if not dets:
-        return sv.Detections.empty()
-    return sv.Detections(
-        xyxy=np.array([d.bbox_xyxy for d in dets]),
-        confidence=np.array([d.confidence for d in dets]),
-        class_id=np.array([d.class_id for d in dets]),
-    )
-
-
 # ── Background worker ─────────────────────────────────────────────────────────
 
 class PipelineWorker(QThread):
@@ -143,6 +134,12 @@ class PipelineWorker(QThread):
             controller = RuleBasedController()
         elif ctrl_name == "ucb":
             controller = UCBBanditController(pipeline_names)
+        elif ctrl_name == "contextual":
+            controller = ContextualBanditController(pipeline_names)
+        elif ctrl_name == "decision_tree":
+            controller = DecisionTreeController(pipeline_names)
+        elif ctrl_name == "random_forest":
+            controller = RandomForestController(pipeline_names)
         else:
             controller = ContextualBanditController(pipeline_names)
 
@@ -234,15 +231,21 @@ class PipelineWorker(QThread):
                         features, dets, last_reward, meta["latency_ms"],
                     )
 
-                sv_dets = _dets_to_sv(dets)
                 annotated = frame.image.copy()
-                if len(sv_dets) > 0:
+                if tracked:
+                    sv_dets = sv.Detections(
+                        xyxy=np.array([t.bbox_xyxy for t in tracked]),
+                        confidence=np.array([t.confidence for t in tracked]),
+                        class_id=np.array([t.class_id for t in tracked]),
+                    )
                     labels = [
                         f"#{t.track_id} {t.class_name} {t.confidence:.2f}"
                         for t in tracked
                     ]
                     annotated = box_annotator.annotate(annotated, sv_dets)
                     annotated = label_annotator.annotate(annotated, sv_dets, labels=labels)
+                else:
+                    sv_dets = sv.Detections.empty()
                 cv2.putText(
                     annotated,
                     f"{meta['selected_pipeline']} | {meta['latency_ms']:.0f}ms"
@@ -356,7 +359,7 @@ class MainWindow(QMainWindow):
         v.addWidget(_cap("CONTROLLER"))
         v.addSpacing(4)
         self.ctrl_combo = QComboBox()
-        self.ctrl_combo.addItems(["rule", "ucb", "contextual"])
+        self.ctrl_combo.addItems(["rule", "ucb", "contextual", "decision_tree", "random_forest"])
         self.ctrl_combo.setStyleSheet(_INPUT)
         v.addWidget(self.ctrl_combo)
         v.addSpacing(14)
