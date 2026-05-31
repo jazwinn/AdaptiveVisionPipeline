@@ -20,6 +20,7 @@ class PipelineC(DetectionPipeline):
         model_path: str | None = None,
         conf: float = 0.25,
         tiling_config: TilingConfig | None = None,
+        imgsz: int = 640,   # accepted for API consistency; tile size is set via TilingConfig
     ):
         if model_path is None:
             model_path = str(_MODELS_DIR / "yolov8n.pt")

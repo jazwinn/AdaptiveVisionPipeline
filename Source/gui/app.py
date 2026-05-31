@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from ..pipelines.pipeline_a import PipelineA
 from ..pipelines.pipeline_b import PipelineB
 from ..pipelines.pipeline_c import PipelineC
 from ..pipelines.pipeline_d import PipelineD
+from ..pipelines.pipeline_e import PipelineE
+from ..pipelines.pipeline_f import PipelineF
 from ..features.extractor import FeatureExtractor
 from ..tracking.tracker import TrackerWrapper
 from ..controller.rule_based import RuleBasedController
@@ -35,6 +38,7 @@ from ..evaluation.benchmark import (
 from ..evaluation.validate import run_validation
 from ..evaluation.pipeline_eval import run_pipeline_comparison, run_controller_comparison
 from ..experiments.logger import ExperimentLogger
+from .train_widget import TrainWidget
 
 import cv2
 import numpy as np
@@ -106,16 +110,39 @@ def _divider() -> QFrame:
 
 class PipelineWorker(QThread):
     frame_ready = pyqtSignal(object, object)   # (np.ndarray, dict)
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
+    finished    = pyqtSignal()
+    error       = pyqtSignal(str)
+    paused      = pyqtSignal(bool)             # True = paused, False = resumed
+    frame_info  = pyqtSignal(int, int)         # (current_idx, total_frames)
 
     def __init__(self, cfg: dict):
         super().__init__()
-        self.cfg = cfg
-        self._stop_event = threading.Event()
+        self.cfg          = cfg
+        self._stop_event  = threading.Event()
+        self._pause_event = threading.Event()
+        self._step_lock   = threading.Lock()
+        self._step_delta  = 0
+        self._seek_target = -1
 
     def stop(self):
+        self._pause_event.clear()   # unblock the pause gate so the thread can exit
         self._stop_event.set()
+
+    def pause(self):
+        self._pause_event.set()
+        self.paused.emit(True)
+
+    def resume(self):
+        self._pause_event.clear()
+        self.paused.emit(False)
+
+    def step(self, delta: int):
+        with self._step_lock:
+            self._step_delta = delta
+
+    def seek(self, idx: int):
+        with self._step_lock:
+            self._seek_target = idx
 
     def run(self):
         try:
@@ -137,6 +164,8 @@ class PipelineWorker(QThread):
         if not cfg["fast_only"]:
             pipelines.append(PipelineD(conf=conf, model_path=model_path))
             pipelines.append(PipelineC(conf=conf, model_path=model_path))
+            pipelines.append(PipelineE(conf=conf, model_path=model_path))
+            pipelines.append(PipelineF(conf=conf, model_path=model_path))
             if cfg["heavy"]:
                 pipelines.append(PipelineB(conf=conf, model_path=model_path))
         pipeline_names = [p.name for p in pipelines]
@@ -184,6 +213,9 @@ class PipelineWorker(QThread):
         )
         logger = ExperimentLogger(run_config) if cfg["log"] else None
         replay = ReplayBuffer() if cfg["replay"] else None
+        if replay is not None:
+            import sys
+            print(f"[REPLAY] Buffer active → {replay.path}", flush=True, file=sys.stderr)
         extractor = FeatureExtractor()
         tracker = TrackerWrapper()
         window_metrics = WindowMetrics()
@@ -216,9 +248,37 @@ class PipelineWorker(QThread):
                 )
 
         try:
-            for frame in reader:
+            idx   = 0
+            total = reader.frame_count
+
+            while not self._stop_event.is_set() and idx < total:
+                # ── Apply any pending seek (works during playback too) ────────
+                with self._step_lock:
+                    if self._seek_target >= 0:
+                        idx = max(0, min(total - 1, self._seek_target))
+                        self._seek_target = -1
+
+                # ── Pause gate ───────────────────────────────────────────────
+                while self._pause_event.is_set() and not self._stop_event.is_set():
+                    with self._step_lock:
+                        if self._seek_target >= 0:
+                            idx = max(0, min(total - 1, self._seek_target))
+                            self._seek_target = -1
+                            break
+                        delta = self._step_delta
+                        self._step_delta = 0
+                    if delta != 0:
+                        idx = max(0, min(total - 1, idx + delta))
+                        break          # fall through to process this one frame
+                    time.sleep(0.05)
+
                 if self._stop_event.is_set():
                     break
+
+                frame = reader.read_at(idx)
+                if frame is None:
+                    idx += 1
+                    continue
 
                 features = extractor.extract(frame.image, [])
                 dets, meta = orchestrator.process(frame, features)
@@ -240,7 +300,7 @@ class PipelineWorker(QThread):
                     controller.update(
                         orchestrator.current_pipeline_name, last_reward, features_snap
                     )
-                    if replay and features_snap:
+                    if replay is not None and features_snap is not None:
                         replay.append(
                             features_snap,
                             orchestrator.current_pipeline_name,
@@ -294,7 +354,12 @@ class PipelineWorker(QThread):
                     "reward": last_reward,
                     "frame_idx": frame.index,
                 }
+                self.frame_info.emit(idx, total)
                 self.frame_ready.emit(annotated, stats)
+
+                # Only auto-advance when not paused; a stepped frame keeps idx
+                if not self._pause_event.is_set():
+                    idx += 1
 
         finally:
             reader.release()
@@ -378,7 +443,8 @@ _TABLE_COLS = [
     "Latency (ms)", "P95 (ms)", "Switches", "Top Pipeline",
 ]
 
-_DIST_PIPELINES = ["fast_baseline", "clahe_pipeline", "tiled", "high_res"]
+_DIST_PIPELINES = ["fast_baseline", "clahe_pipeline", "tiled", "high_res",
+                   "bright_pipeline", "denoise_pipeline"]
 
 _TBL_STYLE = (
     "QTableWidget {"
@@ -741,6 +807,7 @@ class ValidateWorker(QThread):
                 conf=self.cfg["conf"],
                 model_path=self.cfg.get("model_path") or None,
                 selected_pipelines=selected,
+                imgsz=self.cfg.get("imgsz", 640),
                 progress_cb=cb,
                 result_cb=lambda r: self.item_done.emit(r),
             )
@@ -758,14 +825,21 @@ class ValidateWorker(QThread):
                 pct = int((ctrl_idx * n + i) / max(n_total * n, 1) * 100)
                 self.progress.emit(f"Evaluating {name}… image {i + 1}/{n}", pct)
 
+            _replay_path: str | None = None
+            if self.cfg.get("collect_replay"):
+                from ..evaluation.replay_buffer import _DEFAULT_REPLAY_PATH
+                _replay_path = _DEFAULT_REPLAY_PATH
+
             results = run_controller_comparison(
                 data_yaml=self.cfg["data_yaml"],
                 split=self.cfg["split"],
                 conf=self.cfg["conf"],
                 model_path=self.cfg.get("model_path") or None,
                 selected_controllers=selected,
+                imgsz=self.cfg.get("imgsz", 640),
                 progress_cb=cb,
                 result_cb=lambda r: self.item_done.emit(r),
+                replay_path=_replay_path,
             )
             self.progress.emit("Done", 100)
             self.finished.emit({"mode": mode, "result": results})
@@ -775,8 +849,8 @@ class ValidateWorker(QThread):
 
 _VAL_OVERALL_COLS  = ["Metric", "Value"]
 _VAL_CLASS_COLS    = ["Class", "AP50", "AP50-95", "Precision", "Recall"]
-_VAL_COMPARE_COLS  = ["Name", "mAP50", "mAP50-95", "Precision", "Recall", "Latency (ms)"]
-_VAL_CTRL_COLS     = ["Controller", "mAP50", "mAP50-95", "Precision", "Recall", "Latency (ms)", "Top Pipeline"]
+_VAL_COMPARE_COLS  = ["Name", "mAP50", "mAP50-95", "Precision", "Recall", "Latency (ms)", "Missed"]
+_VAL_CTRL_COLS     = ["Controller", "mAP50", "mAP50-95", "Precision", "Recall", "Latency (ms)", "Missed", "Top Pipeline"]
 
 _PROG_STYLE = (
     "QProgressBar { background: #3c3c3c; border: none; border-radius: 3px; height: 8px; }"
@@ -968,7 +1042,8 @@ class ValidateWidget(QWidget):
         v.addSpacing(2)
         self._pipe_chks: dict[str, QCheckBox] = {}
         defaults = {"fast_baseline": True, "clahe_pipeline": True,
-                    "tiled": True, "high_res": False}
+                    "tiled": True, "high_res": False,
+                    "bright_pipeline": True, "denoise_pipeline": True}
         for name, checked in defaults.items():
             chk = QCheckBox(name)
             chk.setChecked(checked)
@@ -994,6 +1069,18 @@ class ValidateWidget(QWidget):
             chk.setStyleSheet(_CHECK)
             v.addWidget(chk)
             self._ctrl_chks[name] = chk
+        v.addSpacing(8)
+        v.addWidget(_cap("LEARNING"))
+        v.addSpacing(2)
+        self._chk_ctrl_replay = QCheckBox("Collect replay data")
+        self._chk_ctrl_replay.setToolTip(
+            "After evaluation, export ground-truth recall rewards to\n"
+            "replay_buffer.jsonl so the Train tab can retrain controllers\n"
+            "on real labelled data."
+        )
+        self._chk_ctrl_replay.setChecked(True)
+        self._chk_ctrl_replay.setStyleSheet(_CHECK)
+        v.addWidget(self._chk_ctrl_replay)
         return w
 
     def _build_right_panel(self) -> QWidget:
@@ -1125,6 +1212,7 @@ class ValidateWidget(QWidget):
                 QMessageBox.warning(self, "No controllers", "Select at least one controller.")
                 return
             cfg["selected"] = selected
+            cfg["collect_replay"] = self._chk_ctrl_replay.isChecked()
             self._ctrl_cmp_table.setRowCount(0)
 
         self._last_report = None
@@ -1241,6 +1329,11 @@ class ValidateWidget(QWidget):
             else:
                 dist = "—"
 
+        fn  = r.get("total_fn")
+        tp  = r.get("total_tp")
+        gt  = (tp or 0) + (fn or 0)
+        missed_str = f"{fn} / {gt}" if fn is not None else "—"
+
         values = [
             name,
             f"{r.get('map50', 0):.4f}",
@@ -1248,6 +1341,7 @@ class ValidateWidget(QWidget):
             f"{r.get('precision', 0):.4f}",
             f"{r.get('recall', 0):.4f}",
             f"{r.get('mean_latency_ms', 0):.1f}",
+            missed_str,
         ]
         if kind == "controller":
             values.append(dist)
@@ -1338,6 +1432,12 @@ class MainWindow(QMainWindow):
             ValidateWidget(model_getter=lambda: self._model_edit.text().strip()),
             "🎯  Validate",
         )
+
+        _replay_default = str(Path(__file__).resolve().parent.parent.parent / "replay_buffer.jsonl")
+        self._train_widget = TrainWidget(replay_path=_replay_default)
+        self._train_widget.models_updated.connect(self._on_models_updated)
+        tabs.addTab(self._train_widget, "🔁  Train")
+
         root.addWidget(tabs)
 
         self._build_status_bar()
@@ -1499,6 +1599,37 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self._on_stop)
         v.addWidget(self.stop_btn)
 
+        # ── Playback controls ──
+        v.addSpacing(8)
+        playback_row = QHBoxLayout()
+        playback_row.setSpacing(4)
+        self.step_back_btn = QPushButton("◀")
+        self.step_back_btn.setFixedWidth(36)
+        self.step_back_btn.setEnabled(False)
+        self.step_back_btn.clicked.connect(lambda: self._worker.step(-1) if self._worker else None)
+        self.pause_btn = QPushButton("⏸ PAUSE")
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.clicked.connect(self._on_pause_toggle)
+        self.step_fwd_btn = QPushButton("▶")
+        self.step_fwd_btn.setFixedWidth(36)
+        self.step_fwd_btn.setEnabled(False)
+        self.step_fwd_btn.clicked.connect(lambda: self._worker.step(1) if self._worker else None)
+        playback_row.addWidget(self.step_back_btn)
+        playback_row.addWidget(self.pause_btn)
+        playback_row.addWidget(self.step_fwd_btn)
+        v.addLayout(playback_row)
+        v.addSpacing(4)
+        self._frame_lbl = QLabel("Frame: — / —")
+        self._frame_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        self._frame_lbl.setAlignment(Qt.AlignCenter)
+        v.addWidget(self._frame_lbl)
+        self.seek_slider = QSlider(Qt.Horizontal)
+        self.seek_slider.setMinimum(0)
+        self.seek_slider.setMaximum(0)
+        self.seek_slider.setEnabled(False)
+        self.seek_slider.sliderMoved.connect(self._on_slider_moved)
+        v.addWidget(self.seek_slider)
+
         return panel
 
     # ── Video area ────────────────────────────────────────────────────────────
@@ -1587,14 +1718,26 @@ class MainWindow(QMainWindow):
             "model_path": self._model_edit.text().strip(),
         }
 
+
+        self._pause_active = False
         self._worker = PipelineWorker(cfg)
         self._worker.frame_ready.connect(self._on_frame)
         self._worker.finished.connect(self._on_done)
         self._worker.error.connect(self._on_error)
+        self._worker.paused.connect(self._on_paused)
+        self._worker.frame_info.connect(self._on_frame_info)
         self._worker.start()
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.pause_btn.setEnabled(True)
+        self.pause_btn.setText("⏸ PAUSE")
+        self.step_back_btn.setEnabled(False)
+        self.step_fwd_btn.setEnabled(False)
+        self._frame_lbl.setText("Frame: — / —")
+        self.seek_slider.setMaximum(0)
+        self.seek_slider.setValue(0)
+        self.seek_slider.setEnabled(True)
         self.video_label.setText("Loading model…")
 
     def _on_stop(self):
@@ -1602,7 +1745,31 @@ class MainWindow(QMainWindow):
             self._worker.stop()
         self.stop_btn.setEnabled(False)
 
+    def _on_pause_toggle(self):
+        if not self._worker:
+            return
+        if self._pause_active:
+            self._worker.resume()
+        else:
+            self._worker.pause()
+
     # ── Slots ─────────────────────────────────────────────────────────────────
+
+    def _on_paused(self, is_paused: bool):
+        self._pause_active = is_paused
+        self.pause_btn.setText("▶ RESUME" if is_paused else "⏸ PAUSE")
+        self.step_back_btn.setEnabled(is_paused)
+        self.step_fwd_btn.setEnabled(is_paused)
+
+    def _on_slider_moved(self, value: int):
+        if self._worker:
+            self._worker.seek(value)
+
+    def _on_frame_info(self, idx: int, total: int):
+        self._frame_lbl.setText(f"Frame: {idx + 1} / {total}")
+        if self.seek_slider.maximum() != total - 1:
+            self.seek_slider.setMaximum(max(0, total - 1))
+        self.seek_slider.setValue(idx)
 
     def _on_frame(self, img, stats: dict):
         self.video_label.update_frame(img)
@@ -1616,12 +1783,48 @@ class MainWindow(QMainWindow):
     def _on_done(self):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("⏸ PAUSE")
+        self.step_back_btn.setEnabled(False)
+        self.step_fwd_btn.setEnabled(False)
+        self.seek_slider.setEnabled(False)
+        self._pause_active = False
         self.statusBar().showMessage("Run complete.", 4000)
 
     def _on_error(self, msg: str):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.pause_btn.setEnabled(False)
+        self.step_back_btn.setEnabled(False)
+        self.step_fwd_btn.setEnabled(False)
+        self.seek_slider.setEnabled(False)
+        self._pause_active = False
         QMessageBox.critical(self, "Pipeline error", msg)
+
+    def _on_models_updated(self) -> None:
+        """
+        Called when the Train tab reloads models.
+
+        If a live-inference worker is currently running, its controller is hot-
+        reloaded in-place so the new weights take effect without restarting.
+        Otherwise, a status-bar message confirms the reload — the next run will
+        automatically pick up the freshly saved model files.
+        """
+        reloaded: list[str] = []
+        if self._worker is not None and hasattr(self._worker, "_orchestrator"):
+            ctrl = getattr(self._worker._orchestrator, "_controller", None)
+            if ctrl is not None and hasattr(ctrl, "reload"):
+                ctrl.reload()
+                reloaded.append(type(ctrl).__name__)
+
+        if reloaded:
+            self.statusBar().showMessage(
+                f"Models reloaded live: {', '.join(reloaded)}", 5000
+            )
+        else:
+            self.statusBar().showMessage(
+                "Models reloaded — next run will use updated weights.", 5000
+            )
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

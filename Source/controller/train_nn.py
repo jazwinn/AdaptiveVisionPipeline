@@ -42,7 +42,10 @@ AGG_FEATURE_NAMES: list[str] = (
     [f"mean_{f}" for f in FEATURE_NAMES] + [f"std_{f}" for f in FEATURE_NAMES]
 )
 
-PIPELINE_NAMES: list[str] = ["fast_baseline", "clahe_pipeline", "tiled", "high_res"]
+PIPELINE_NAMES: list[str] = [
+    "fast_baseline", "clahe_pipeline", "tiled", "high_res",
+    "bright_pipeline", "denoise_pipeline",
+]
 
 
 # ── Data loading ───────────────────────────────────────────────────────────────
@@ -63,42 +66,84 @@ def load_replay_data(path: str) -> list[dict]:
     return records
 
 
-def generate_synthetic_data(n_samples: int = 500) -> list[dict]:
-    """Synthetic samples using rule-based heuristics + random noise."""
+def generate_synthetic_data(n_samples: int = 2000) -> list[dict]:
+    """
+    Balanced synthetic samples — equal representation of all 6 pipelines.
+
+    Each pipeline gets n_samples // 6 samples generated with features that
+    reliably trigger that pipeline's routing condition.  All samples carry the
+    correct label and a high reward (0.75–1.0).
+
+    Why no negative samples: supervised classifiers (DT, NN) train on
+    (features → label) pairs.  Adding wrong labels — even with low weight —
+    teaches the model to hedge toward the safe default (fast_baseline) instead
+    of learning clean decision boundaries.
+
+    Why balanced classes: uniform random features cause ~60 % of samples to
+    satisfy `overexposed_ratio > 0.20`, flooding the training set with
+    bright_pipeline and starving the other classes.
+    """
     rng = np.random.default_rng(42)
-    records: list[dict] = []
-    for _ in range(n_samples):
-        feat = {
-            "laplacian_variance":     float(rng.uniform(10, 1500)),
-            "fft_blur_score":         float(rng.uniform(0, 100)),
-            "mean_intensity":         float(rng.uniform(20, 235)),
-            "intensity_std":          float(rng.uniform(5, 80)),
-            "underexposed_ratio":     float(rng.uniform(0, 0.5)),
-            "overexposed_ratio":      float(rng.uniform(0, 0.3)),
-            "optical_flow_magnitude": float(rng.uniform(0, 20)),
-            "frame_displacement":     float(rng.uniform(0, 30)),
-            "mean_confidence":        float(rng.uniform(0.1, 0.95)),
-            "detection_count":        int(rng.integers(0, 30)),
-            "small_object_ratio":     float(rng.uniform(0, 1)),
-            "edge_density":           float(rng.uniform(0, 0.4)),
-            "entropy":                float(rng.uniform(2, 8)),
+
+    def _base() -> dict:
+        """'Normal' feature values that do NOT trigger any routing rule."""
+        return {
+            "laplacian_variance":     float(rng.uniform(150, 1200)),
+            "fft_blur_score":         float(rng.uniform(20, 80)),
+            "mean_intensity":         float(rng.uniform(70, 172)),   # < 180
+            "intensity_std":          float(rng.uniform(36, 62)),    # 35–65: no clahe/denoise
+            "underexposed_ratio":     float(rng.uniform(0.0, 0.10)), # < 0.15
+            "overexposed_ratio":      float(rng.uniform(0.0, 0.12)), # < 0.20
+            "optical_flow_magnitude": float(rng.uniform(0.0, 7.0)),  # < 8
+            "frame_displacement":     float(rng.uniform(0, 15)),
+            "mean_confidence":        float(rng.uniform(0.45, 0.95)),
+            "detection_count":        int(rng.integers(5, 25)),
+            "small_object_ratio":     float(rng.uniform(0.0, 0.40)), # < 0.5
+            "edge_density":           float(rng.uniform(0.0, 0.12)), # < 0.15
+            "entropy":                float(rng.uniform(4, 7)),
         }
-        # Mirror rule_based.py heuristics for labels
-        if feat["mean_intensity"] < 60 and feat["intensity_std"] < 25:
-            pipeline = "clahe_pipeline"
-        elif feat["optical_flow_magnitude"] > 8.0:
-            pipeline = "fast_baseline"
-        elif feat["small_object_ratio"] > 0.5 or feat["edge_density"] > 0.15:
-            pipeline = "tiled"
-        elif feat["mean_confidence"] < 0.35 and feat["detection_count"] < 3:
-            pipeline = "high_res"
-        else:
-            pipeline = "fast_baseline"
 
-        reward = float(rng.uniform(-0.5, 2.5))
-        records.append({"features": feat, "pipeline": pipeline, "reward": reward})
+    n_per = max(1, n_samples // len(PIPELINE_NAMES))
+    records: list[dict] = []
 
-    return records
+    for _ in range(n_per):
+        # bright_pipeline: overexposed image
+        f = _base(); f["overexposed_ratio"] = float(rng.uniform(0.25, 0.50))
+        records.append({"features": f, "pipeline": "bright_pipeline",  "reward": float(rng.uniform(0.75, 1.0))})
+
+    for _ in range(n_per):
+        # denoise_pipeline: noisy (high intensity_std), not overexposed
+        f = _base(); f["intensity_std"] = float(rng.uniform(68, 100))
+        records.append({"features": f, "pipeline": "denoise_pipeline", "reward": float(rng.uniform(0.75, 1.0))})
+
+    for _ in range(n_per):
+        # clahe_pipeline: dark / blurry / low-contrast, not noisy or overexposed
+        f = _base()
+        f["intensity_std"]      = float(rng.uniform(5, 30))    # < 35 → clahe
+        f["underexposed_ratio"] = float(rng.uniform(0.20, 0.50))
+        f["laplacian_variance"] = float(rng.uniform(10, 90))
+        records.append({"features": f, "pipeline": "clahe_pipeline",   "reward": float(rng.uniform(0.75, 1.0))})
+
+    for _ in range(n_per):
+        # fast_baseline: high motion, image quality is fine
+        f = _base(); f["optical_flow_magnitude"] = float(rng.uniform(9, 20))
+        records.append({"features": f, "pipeline": "fast_baseline",    "reward": float(rng.uniform(0.75, 1.0))})
+
+    for _ in range(n_per):
+        # tiled: small / densely packed objects, low motion
+        f = _base(); f["small_object_ratio"] = float(rng.uniform(0.55, 1.0))
+        records.append({"features": f, "pipeline": "tiled",            "reward": float(rng.uniform(0.75, 1.0))})
+
+    for _ in range(n_per):
+        # high_res: low confidence + few detections, no other trigger
+        f = _base()
+        f["mean_confidence"] = float(rng.uniform(0.10, 0.30))
+        f["detection_count"] = int(rng.integers(0, 3))
+        records.append({"features": f, "pipeline": "high_res",         "reward": float(rng.uniform(0.75, 1.0))})
+
+    # Shuffle so classes are interleaved during training
+    idx = rng.permutation(len(records))
+    return [records[i] for i in idx]
 
 
 # ── Dataset construction ───────────────────────────────────────────────────────
@@ -303,7 +348,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--replay",
-        default="replay_buffer.jsonl",
+        default=str(Path(__file__).resolve().parent.parent.parent / "replay_buffer.jsonl"),
         help="Path to replay buffer JSONL file",
     )
     p.add_argument(
@@ -328,8 +373,8 @@ def main() -> None:
 
     records = load_replay_data(args.replay)
     if not records:
-        print(f"No data found at '{args.replay}' -generating 500 synthetic samples.")
-        records = generate_synthetic_data(500)
+        print(f"No data found at '{args.replay}' — generating 2000 synthetic samples.")
+        records = generate_synthetic_data(2000)
     else:
         print(f"Loaded {len(records)} records from '{args.replay}'.")
 

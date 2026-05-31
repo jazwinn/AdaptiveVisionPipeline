@@ -359,13 +359,68 @@ class NeuralRLController(MetaController):
             self._q_target.load_state_dict(self._q_online.state_dict())
             self._q_target.eval()
 
+    # ── Hot-reload & export ────────────────────────────────────────────────
+
+    def reload(self) -> None:
+        """Reload model from disk (e.g. after retraining). Safe to call at any time."""
+        self._q_online = None
+        self._q_target = None
+        self._optimizer = None
+        self._pipeline_names_from_model = []
+        self._last_state = None
+        self._last_action = None
+        if _TORCH_AVAILABLE:
+            self._load_model()
+
+    def export_pending(self, replay_path: str) -> int:
+        """
+        Write the online-learned transitions from the internal replay buffer to
+        the global replay JSONL file.
+
+        Each transition ``(s, a, r, s_next)`` is converted to the shared record
+        format ``{features, pipeline, reward}`` using the current state ``s`` as
+        features and the action index mapped back to a pipeline name.
+
+        Returns the number of entries written.
+        """
+        import json
+        import time as _time
+
+        if len(self._replay) == 0:
+            return 0
+        if not self._pipeline_names_from_model:
+            return 0
+
+        p = Path(replay_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        written = 0
+        with p.open("a") as fh:
+            for s, a, r, _ in self._replay._buf:
+                if a >= len(self._pipeline_names_from_model):
+                    continue
+                pipeline = self._pipeline_names_from_model[a]
+                feat_dict = {name: float(s[i]) for i, name in enumerate(FEATURE_NAMES)}
+                entry = {
+                    "timestamp": _time.time(),
+                    "features":  feat_dict,
+                    "pipeline":  pipeline,
+                    "reward":    float(r),
+                }
+                fh.write(json.dumps(entry) + "\n")
+                written += 1
+        return written
+
     # ── Rule-based fallback ────────────────────────────────────────────────
 
     def _rule_fallback(self, f: FeatureVector, pipeline_names: list[str]) -> str:
         def _avail(name: str) -> str:
             return name if name in pipeline_names else pipeline_names[0]
 
-        if f.mean_intensity < 60 and f.intensity_std < 25:
+        if f.overexposed_ratio > 0.20 or f.mean_intensity > 180:
+            return _avail("bright_pipeline")
+        if f.intensity_std > 65:
+            return _avail("denoise_pipeline")
+        if f.intensity_std < 35 or f.underexposed_ratio > 0.15 or f.laplacian_variance < 100:
             return _avail("clahe_pipeline")
         if f.optical_flow_magnitude > 8.0:
             return _avail("fast_baseline")

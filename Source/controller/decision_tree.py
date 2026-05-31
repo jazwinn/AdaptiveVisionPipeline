@@ -87,6 +87,39 @@ class DecisionTreeController(MetaController):
         if features is not None and len(self._pending) < _PENDING_MAX:
             self._pending.append((aggregate_history([features]), pipeline_name, reward))
 
+    def reload(self) -> None:
+        """Reload model from disk (e.g. after retraining). Safe to call at any time."""
+        self._model = None
+        self._selected_features = None
+        self._load_model()
+
+    def export_pending(self, replay_path: str) -> int:
+        """
+        Write accumulated experience from ``_pending`` to the global replay buffer.
+
+        Returns the number of entries written and clears ``_pending``.
+        """
+        import json
+        import time as _time
+
+        if not self._pending:
+            return 0
+        p = Path(replay_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as fh:
+            for vec, pipeline, reward in self._pending:
+                feat_dict = {name: float(vec[i]) for i, name in enumerate(FEATURE_NAMES)}
+                entry = {
+                    "timestamp": _time.time(),
+                    "features":  feat_dict,
+                    "pipeline":  pipeline,
+                    "reward":    float(reward),
+                }
+                fh.write(json.dumps(entry) + "\n")
+        n = len(self._pending)
+        self._pending.clear()
+        return n
+
     def _rule_fallback(self, f: FeatureVector, pipeline_names: list[str]) -> str:
         def _avail(name: str) -> str:
             return name if name in pipeline_names else pipeline_names[0]

@@ -52,8 +52,10 @@ class FrameReader:
             )
             if not paths:
                 raise RuntimeError(
-                    f"No images found in directory: {source}  "
-                    f"(supported extensions: {sorted(_IMAGE_EXTS)})"
+                    f"No images found in directory: {source}\n"
+                    f"Supported extensions: {sorted(_IMAGE_EXTS)}\n"
+                    f"Make sure the folder contains image files directly, "
+                    f"not inside a subfolder."
                 )
             self._image_paths = paths
             probe = cv2.imread(str(paths[0]))
@@ -139,6 +141,28 @@ class FrameReader:
     # ------------------------------------------------------------------ #
     # Cleanup                                                              #
     # ------------------------------------------------------------------ #
+
+    def read_at(self, idx: int) -> "Frame | None":
+        """Read a specific frame by index without advancing the iterator."""
+        if self.source_type == "image":
+            if idx == 0:
+                return Frame(index=0, timestamp_ms=0.0, image=self._single_image.copy(),
+                             source_path=self.source)
+            return None
+        if self.source_type == "directory":
+            if 0 <= idx < len(self._image_paths):
+                img = cv2.imread(str(self._image_paths[idx]))
+                if img is not None:
+                    return Frame(index=idx, timestamp_ms=float(idx * 1000),
+                                 image=img, source_path=str(self._image_paths[idx]))
+            return None
+        # video
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, img = self.cap.read()
+        if ret:
+            ts = self.cap.get(cv2.CAP_PROP_POS_MSEC)
+            return Frame(index=idx, timestamp_ms=ts, image=img, source_path=self.source)
+        return None
 
     def release(self):
         if self.cap is not None:

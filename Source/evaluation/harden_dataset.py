@@ -212,10 +212,24 @@ def harden_split(
 
 
 def write_data_hard_yaml(dataset_dir: Path, processed_splits: list[str]) -> Path:
-    """Write data_hard.yaml pointing hard splits at *_hard variants."""
+    """Write data_hard.yaml pointing hard splits at *_hard variants.
+
+    A split is pointed at its _hard folder if it was in ``processed_splits``
+    OR if the ``<split>_hard/images`` folder already exists on disk (so
+    running ``--split valid`` after a previous ``--split test`` run doesn't
+    silently revert the test entry back to the original path).
+    """
+    def _hard_if_exists(split: str, orig_name: str) -> str:
+        hard_dir = dataset_dir / f"{split}_hard" / "images"
+        if split in processed_splits or hard_dir.exists():
+            # No "../" — the _hard folders are siblings of data_hard.yaml inside
+            # the dataset directory, so a plain relative path resolves correctly.
+            return f"{split}_hard/images"
+        return f"../{orig_name}/images"
+
     train_path = "../train/images"
-    valid_path = "../valid_hard/images" if "valid" in processed_splits else "../valid/images"
-    test_path  = "../test_hard/images"  if "test"  in processed_splits else "../test/images"
+    valid_path = _hard_if_exists("valid", "valid")
+    test_path  = _hard_if_exists("test",  "test")
 
     content = (
         f"train: {train_path}\n"

@@ -21,6 +21,8 @@ from ..pipelines.pipeline_a import PipelineA
 from ..pipelines.pipeline_b import PipelineB
 from ..pipelines.pipeline_c import PipelineC
 from ..pipelines.pipeline_d import PipelineD
+from ..pipelines.pipeline_e import PipelineE
+from ..pipelines.pipeline_f import PipelineF
 from ..features.extractor import FeatureExtractor
 from ..tracking.tracker import TrackerWrapper
 from ..evaluation.metrics import WindowMetrics, compute_reward, compute_reward_image
@@ -69,8 +71,9 @@ def build_pipelines(
     conf: float = 0.30,
     include_heavy: bool = True,
     model_path: str | None = None,
+    imgsz: int = 640,
 ) -> list[DetectionPipeline]:
-    """Build detection pipelines. Always includes A, C, D; optionally B (YOLOv8m).
+    """Build detection pipelines. Always includes A, C, D, E, F; optionally B (YOLOv8m).
 
     Parameters
     ----------
@@ -78,17 +81,21 @@ def build_pipelines(
     include_heavy: whether to include PipelineB (YOLOv8m)
     model_path   : optional path to a custom .pt or .onnx weights file.
                    When None each pipeline uses its own default weights.
+    imgsz        : inference image size (pixels). 640 is default; 1280 improves
+                   recall on small or degraded objects at the cost of latency.
     """
     mp_light = model_path or str(_MODELS_DIR / "yolov8n.pt")
     mp_heavy = model_path or str(_MODELS_DIR / "yolov8m.pt")
     pipelines: list[DetectionPipeline] = [
-        PipelineA(conf=conf, model_path=mp_light),
-        PipelineD(conf=conf, model_path=mp_light),
-        PipelineC(conf=conf, model_path=mp_light),
+        PipelineA(conf=conf, model_path=mp_light, imgsz=imgsz),
+        PipelineD(conf=conf, model_path=mp_light, imgsz=imgsz),
+        PipelineC(conf=conf, model_path=mp_light, imgsz=imgsz),
+        PipelineE(conf=conf, model_path=mp_light, imgsz=imgsz),
+        PipelineF(conf=conf, model_path=mp_light, imgsz=imgsz),
     ]
     if include_heavy:
         try:
-            pipelines.append(PipelineB(conf=conf, model_path=mp_heavy))
+            pipelines.append(PipelineB(conf=conf, model_path=mp_heavy, imgsz=imgsz))
         except Exception as exc:
             print(f"[WARN] Could not load PipelineB (YOLOv8m): {exc}. Running without it.")
     return pipelines

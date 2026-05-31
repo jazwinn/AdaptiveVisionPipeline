@@ -201,13 +201,57 @@ class NeuralNetController(MetaController):
                 (aggregate_history([features]), pipeline_name, reward)
             )
 
+    # ── Hot-reload & export ────────────────────────────────────────────────
+
+    def reload(self) -> None:
+        """Reload model from disk (e.g. after retraining). Safe to call at any time."""
+        self._model = None
+        self._pipeline_classes = []
+        if _TORCH_AVAILABLE:
+            self._load_model()
+
+    def export_pending(self, replay_path: str) -> int:
+        """
+        Write accumulated experience from ``_pending`` to the global replay buffer.
+
+        ``_pending`` fills during ``update()`` calls (e.g. from validate runs that
+        have ground-truth recall rewards).  Calling this persists that experience
+        so the next ``train_nn.py`` run benefits from it.
+
+        Returns the number of entries written and clears ``_pending``.
+        """
+        import json
+        import time as _time
+
+        if not self._pending:
+            return 0
+        p = Path(replay_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a") as fh:
+            for vec, pipeline, reward in self._pending:
+                feat_dict = {name: float(vec[i]) for i, name in enumerate(FEATURE_NAMES)}
+                entry = {
+                    "timestamp": _time.time(),
+                    "features":  feat_dict,
+                    "pipeline":  pipeline,
+                    "reward":    float(reward),
+                }
+                fh.write(json.dumps(entry) + "\n")
+        n = len(self._pending)
+        self._pending.clear()
+        return n
+
     # ── Rule-based fallback ────────────────────────────────────────────────
 
     def _rule_fallback(self, f: FeatureVector, pipeline_names: list[str]) -> str:
         def _avail(name: str) -> str:
             return name if name in pipeline_names else pipeline_names[0]
 
-        if f.mean_intensity < 60 and f.intensity_std < 25:
+        if f.overexposed_ratio > 0.20 or f.mean_intensity > 180:
+            return _avail("bright_pipeline")
+        if f.intensity_std > 65:
+            return _avail("denoise_pipeline")
+        if f.intensity_std < 35 or f.underexposed_ratio > 0.15 or f.laplacian_variance < 100:
             return _avail("clahe_pipeline")
         if f.optical_flow_magnitude > 8.0:
             return _avail("fast_baseline")

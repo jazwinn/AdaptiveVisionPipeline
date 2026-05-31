@@ -16,8 +16,18 @@ class RuleBasedController(MetaController):
         def _available(name: str) -> str:
             return name if name in pipeline_names else pipeline_names[0]
 
-        # Low-light: dim and low contrast
-        if f.mean_intensity < 60 and f.intensity_std < 25:
+        # Overexposure / glare — gamma correction recovers blown highlights
+        if f.overexposed_ratio > 0.20 or f.mean_intensity > 180:
+            return _available("bright_pipeline")
+
+        # Heavy noise — NLM denoising before inference
+        if f.intensity_std > 65:
+            return _available("denoise_pipeline")
+
+        # Low contrast / underexposed / blurry — CLAHE restores local contrast
+        if (f.intensity_std < 35
+                or f.underexposed_ratio > 0.15
+                or f.laplacian_variance < 100):
             return _available("clahe_pipeline")
 
         # High motion: prioritise speed
