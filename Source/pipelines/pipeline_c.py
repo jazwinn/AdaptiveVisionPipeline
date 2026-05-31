@@ -1,9 +1,12 @@
 from __future__ import annotations
+from pathlib import Path
 import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 from ..core.pipeline import DetectionPipeline, Detection
 from ..core.config import TilingConfig
+
+_MODELS_DIR = Path(__file__).resolve().parent.parent.parent / "models"
 
 
 class PipelineC(DetectionPipeline):
@@ -14,10 +17,12 @@ class PipelineC(DetectionPipeline):
 
     def __init__(
         self,
-        model_path: str = "yolov8n.pt",
+        model_path: str | None = None,
         conf: float = 0.25,
         tiling_config: TilingConfig | None = None,
     ):
+        if model_path is None:
+            model_path = str(_MODELS_DIR / "yolov8n.pt")
         self.model = YOLO(model_path)
         self.conf = conf
         self.cfg = tiling_config or TilingConfig()

@@ -1,7 +1,10 @@
 from __future__ import annotations
+from pathlib import Path
 import numpy as np
 from ultralytics import YOLO
 from ..core.pipeline import DetectionPipeline, Detection
+
+_MODELS_DIR = Path(__file__).resolve().parent.parent.parent / "models"
 
 
 class PipelineB(DetectionPipeline):
@@ -10,7 +13,9 @@ class PipelineB(DetectionPipeline):
     name = "high_res"
     cost_estimate = 4.0
 
-    def __init__(self, model_path: str = "yolov8m.pt", imgsz: int = 1280, conf: float = 0.25):
+    def __init__(self, model_path: str | None = None, imgsz: int = 1280, conf: float = 0.25):
+        if model_path is None:
+            model_path = str(_MODELS_DIR / "yolov8m.pt")
         self.model = YOLO(model_path)
         self.imgsz = imgsz
         self.conf = conf

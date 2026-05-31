@@ -1,8 +1,11 @@
 from __future__ import annotations
+from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
 from ..core.pipeline import DetectionPipeline, Detection
+
+_MODELS_DIR = Path(__file__).resolve().parent.parent.parent / "models"
 
 
 def apply_clahe(image: np.ndarray) -> np.ndarray:
@@ -18,7 +21,9 @@ class PipelineD(DetectionPipeline):
     name = "clahe_pipeline"
     cost_estimate = 1.5
 
-    def __init__(self, model_path: str = "yolov8n.pt", imgsz: int = 640, conf: float = 0.3):
+    def __init__(self, model_path: str | None = None, imgsz: int = 640, conf: float = 0.3):
+        if model_path is None:
+            model_path = str(_MODELS_DIR / "yolov8n.pt")
         self.model = YOLO(model_path)
         self.imgsz = imgsz
         self.conf = conf

@@ -45,7 +45,7 @@ class DecisionTreeController(MetaController):
         self._pending: list[tuple[np.ndarray, str, float]] = []
 
         if model_path is None:
-            model_path = Path(__file__).parent / "models" / self.MODEL_FILENAME
+            model_path = Path(__file__).resolve().parent / "models" / self.MODEL_FILENAME
         self._model_path = Path(model_path)
         self._load_model()
 

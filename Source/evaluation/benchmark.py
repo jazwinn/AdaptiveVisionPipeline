@@ -29,6 +29,9 @@ from ..controller.base import MetaController
 from ..controller.rule_based import RuleBasedController
 from ..controller.bandit import UCBBanditController, ContextualBanditController
 from ..controller.decision_tree import DecisionTreeController, RandomForestController
+from ..controller.neural_net import NeuralNetController
+from ..controller.neural_rl import NeuralRLController
+from ..controller.none import NoneController
 
 # ── Dataclasses ───────────────────────────────────────────────────────────────
 
@@ -65,16 +68,27 @@ class PerWindowRecord:
 def build_pipelines(
     conf: float = 0.30,
     include_heavy: bool = True,
+    model_path: str | None = None,
 ) -> list[DetectionPipeline]:
-    """Build detection pipelines. Always includes A, C, D; optionally B (YOLOv8m)."""
+    """Build detection pipelines. Always includes A, C, D; optionally B (YOLOv8m).
+
+    Parameters
+    ----------
+    conf         : detection confidence threshold
+    include_heavy: whether to include PipelineB (YOLOv8m)
+    model_path   : optional path to a custom .pt or .onnx weights file.
+                   When None each pipeline uses its own default weights.
+    """
+    mp_light = model_path or str(_MODELS_DIR / "yolov8n.pt")
+    mp_heavy = model_path or str(_MODELS_DIR / "yolov8m.pt")
     pipelines: list[DetectionPipeline] = [
-        PipelineA(conf=conf),
-        PipelineD(conf=conf),
-        PipelineC(conf=conf),
+        PipelineA(conf=conf, model_path=mp_light),
+        PipelineD(conf=conf, model_path=mp_light),
+        PipelineC(conf=conf, model_path=mp_light),
     ]
     if include_heavy:
         try:
-            pipelines.append(PipelineB(conf=conf))
+            pipelines.append(PipelineB(conf=conf, model_path=mp_heavy))
         except Exception as exc:
             print(f"[WARN] Could not load PipelineB (YOLOv8m): {exc}. Running without it.")
     return pipelines
@@ -82,7 +96,7 @@ def build_pipelines(
 
 # ── Controller factory ────────────────────────────────────────────────────────
 
-_MODELS_DIR = Path(__file__).parent.parent / "controller" / "models"
+_MODELS_DIR = Path(__file__).resolve().parent.parent / "controller" / "models"
 
 _TREE_CONTROLLERS: dict[str, type[DecisionTreeController]] = {
     "decision_tree": DecisionTreeController,
@@ -110,7 +124,9 @@ def build_controllers(
     warnings: list[str] = []
 
     for name in selected:
-        if name == "rule":
+        if name == "none":
+            controllers.append((name, NoneController()))
+        elif name == "rule":
             controllers.append((name, RuleBasedController()))
         elif name == "ucb":
             controllers.append((name, UCBBanditController(pipeline_names)))
@@ -127,6 +143,24 @@ def build_controllers(
                 warnings.append(msg)
                 continue
             controllers.append((name, cls(pipeline_names, model_path=model_path)))
+        elif name == "neural_net":
+            model_path = models_dir / NeuralNetController.MODEL_FILENAME
+            if not model_path.exists():
+                warnings.append(
+                    f"Skipping 'neural_net': model not found at {model_path}. "
+                    f"Run: python -m Source.controller.train_nn"
+                )
+                continue
+            controllers.append((name, NeuralNetController(pipeline_names, model_path=model_path)))
+        elif name == "neural_rl":
+            model_path = models_dir / NeuralRLController.MODEL_FILENAME
+            if not model_path.exists():
+                warnings.append(
+                    f"Skipping 'neural_rl': model not found at {model_path}. "
+                    f"Run: python -m Source.controller.train_rl"
+                )
+                continue
+            controllers.append((name, NeuralRLController(pipeline_names, model_path=model_path)))
         else:
             warnings.append(f"Unknown controller name '{name}' — skipped.")
 

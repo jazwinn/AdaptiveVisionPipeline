@@ -22,6 +22,9 @@ from ..tracking.tracker import TrackerWrapper
 from ..controller.rule_based import RuleBasedController
 from ..controller.bandit import UCBBanditController, ContextualBanditController
 from ..controller.decision_tree import DecisionTreeController, RandomForestController
+from ..controller.neural_net import NeuralNetController
+from ..controller.neural_rl import NeuralRLController
+from ..controller.none import NoneController
 from ..controller.orchestrator import PipelineOrchestrator
 from ..evaluation.metrics import WindowMetrics, compute_reward
 from ..evaluation.replay_buffer import ReplayBuffer
@@ -126,16 +129,20 @@ class PipelineWorker(QThread):
         source_path = cfg["source"]
         conf = cfg["conf"]
 
-        pipelines = [PipelineA(conf=conf)]
+        model_path = cfg.get("model_path") or None
+        # None triggers each pipeline's built-in default (models/ at project root)
+        pipelines = [PipelineA(conf=conf, model_path=model_path)]
         if not cfg["fast_only"]:
-            pipelines.append(PipelineD(conf=conf))
-            pipelines.append(PipelineC(conf=conf))
+            pipelines.append(PipelineD(conf=conf, model_path=model_path))
+            pipelines.append(PipelineC(conf=conf, model_path=model_path))
             if cfg["heavy"]:
-                pipelines.append(PipelineB(conf=conf))
+                pipelines.append(PipelineB(conf=conf, model_path=model_path))
         pipeline_names = [p.name for p in pipelines]
 
         ctrl_name = cfg["controller"]
-        if ctrl_name == "rule":
+        if ctrl_name == "none":
+            controller = NoneController()
+        elif ctrl_name == "rule":
             controller = RuleBasedController()
         elif ctrl_name == "ucb":
             controller = UCBBanditController(pipeline_names)
@@ -145,6 +152,10 @@ class PipelineWorker(QThread):
             controller = DecisionTreeController(pipeline_names)
         elif ctrl_name == "random_forest":
             controller = RandomForestController(pipeline_names)
+        elif ctrl_name == "neural_net":
+            controller = NeuralNetController(pipeline_names)
+        elif ctrl_name == "neural_rl":
+            controller = NeuralRLController(pipeline_names)
         else:
             controller = ContextualBanditController(pipeline_names)
 
@@ -313,6 +324,7 @@ class BenchmarkWorker(QThread):
         pipelines = build_pipelines(
             conf=cfg["conf"],
             include_heavy=cfg["include_heavy"],
+            model_path=cfg.get("model_path") or None,
         )
         pipeline_names = [p.name for p in pipelines]
 
@@ -372,15 +384,20 @@ _TBL_STYLE = (
 
 
 class BenchmarkWidget(QWidget):
-    def __init__(self, source_getter):
+    def __init__(self, source_getter, model_getter=None):
         """
         Parameters
         ----------
         source_getter : callable() → str
             Returns the source path from the main panel's SOURCE field.
+        model_getter  : callable() → str, optional
+            Returns the model path from the main panel's MODEL field.
+            When None or when the returned string is empty, pipelines use
+            their default weights.
         """
         super().__init__()
         self._source_getter = source_getter
+        self._model_getter = model_getter or (lambda: "")
         self._worker: BenchmarkWorker | None = None
         self._all_records: list[PerWindowRecord] = []
         self._build_ui()
@@ -401,9 +418,9 @@ class BenchmarkWidget(QWidget):
         v.addWidget(_cap("CONTROLLERS"))
         v.addSpacing(4)
         self._chk_controllers: dict[str, QCheckBox] = {}
-        for name in ("rule", "ucb", "contextual", "decision_tree", "random_forest"):
+        for name in ("none", "rule", "ucb", "contextual", "decision_tree", "random_forest", "neural_net", "neural_rl"):
             chk = QCheckBox(name)
-            chk.setChecked(True)
+            chk.setChecked(name != "none")  # "none" unchecked by default
             chk.setStyleSheet(_CHECK)
             v.addWidget(chk)
             self._chk_controllers[name] = chk
@@ -431,6 +448,12 @@ class BenchmarkWidget(QWidget):
         self._run_btn.setStyleSheet(_BTN_START)
         self._run_btn.clicked.connect(self._on_run)
         v.addWidget(self._run_btn)
+        v.addSpacing(6)
+        self._stop_btn = QPushButton("STOP")
+        self._stop_btn.setStyleSheet(_BTN_STOP)
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.clicked.connect(self._on_stop)
+        v.addWidget(self._stop_btn)
         v.addSpacing(6)
         self._save_btn = QPushButton("SAVE CSV")
         self._save_btn.setStyleSheet(_BTN_SMALL)
@@ -519,6 +542,7 @@ class BenchmarkWidget(QWidget):
             "window":        self._window_spin.value(),
             "include_heavy": self._chk_heavy.isChecked(),
             "selected":      selected,
+            "model_path":    self._model_getter().strip(),
         }
 
         self._worker = BenchmarkWorker(cfg)
@@ -529,6 +553,7 @@ class BenchmarkWidget(QWidget):
         self._worker.start()
 
         self._run_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
         self._progress_bar.setValue(0)
         self._progress_bar.setVisible(True)
 
@@ -542,15 +567,25 @@ class BenchmarkWidget(QWidget):
         self._add_dist_row(result)
         self._colour_best_reward()
 
+    def _on_stop(self):
+        if self._worker is not None:
+            self._worker.stop()
+        self._stop_btn.setEnabled(False)
+        self._status_lbl.setText("Stopping…")
+
     def _on_finished(self, results, records):
         self._all_records = records
         self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
         self._progress_bar.setVisible(False)
         self._save_btn.setEnabled(bool(records))
-        self._status_lbl.setText(f"Done — {len(results)} controller(s) benchmarked.")
+        n = len(results)
+        suffix = " (stopped early)" if self._worker and self._worker._stop.is_set() else ""
+        self._status_lbl.setText(f"Done — {n} controller(s) benchmarked.{suffix}")
 
     def _on_error(self, msg: str):
         self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
         self._progress_bar.setVisible(False)
         QMessageBox.critical(self, "Benchmark error", msg)
 
@@ -679,7 +714,10 @@ class MainWindow(QMainWindow):
         )
         tabs.addTab(self._build_video_area(), "▶  Live")
         tabs.addTab(
-            BenchmarkWidget(lambda: self.source_edit.text().strip()),
+            BenchmarkWidget(
+                source_getter=lambda: self.source_edit.text().strip(),
+                model_getter=lambda: self._model_edit.text().strip(),
+            ),
             "📊  Benchmark",
         )
         root.addWidget(tabs)
@@ -716,6 +754,23 @@ class MainWindow(QMainWindow):
         src_row.addWidget(btn_file)
         src_row.addWidget(btn_dir)
         v.addLayout(src_row)
+        v.addSpacing(10)
+
+        # ── Model ──
+        v.addWidget(_cap("MODEL  (optional)"))
+        v.addSpacing(4)
+        model_row = QHBoxLayout()
+        model_row.setSpacing(4)
+        self._model_edit = QLineEdit()
+        self._model_edit.setPlaceholderText("Default (models/yolov8n.pt)")
+        self._model_edit.setStyleSheet(_INPUT)
+        model_row.addWidget(self._model_edit)
+        btn_model = QPushButton("…")
+        btn_model.setFixedWidth(32)
+        btn_model.setStyleSheet(_BTN_SMALL)
+        btn_model.clicked.connect(self._on_browse_model)
+        model_row.addWidget(btn_model)
+        v.addLayout(model_row)
         v.addSpacing(14)
 
         # ── Controller ──
@@ -724,7 +779,12 @@ class MainWindow(QMainWindow):
         v.addWidget(_cap("CONTROLLER"))
         v.addSpacing(4)
         self.ctrl_combo = QComboBox()
-        self.ctrl_combo.addItems(["rule", "ucb", "contextual", "decision_tree", "random_forest"])
+        self.ctrl_combo.addItems([
+            "none",
+            "rule", "ucb", "contextual",
+            "decision_tree", "random_forest",
+            "neural_net", "neural_rl",
+        ])
         self.ctrl_combo.setStyleSheet(_INPUT)
         v.addWidget(self.ctrl_combo)
         v.addSpacing(14)
@@ -875,6 +935,14 @@ class MainWindow(QMainWindow):
         if path:
             self.output_edit.setText(path)
 
+    def _on_browse_model(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select model weights", "",
+            "Model files (*.pt *.onnx);;All files (*)",
+        )
+        if path:
+            self._model_edit.setText(path)
+
     # ── Run control ───────────────────────────────────────────────────────────
 
     def _on_start(self):
@@ -898,6 +966,7 @@ class MainWindow(QMainWindow):
             "fast_only":  self.chk_fast_only.isChecked(),
             "heavy":      self.chk_heavy.isChecked(),
             "output":     self.output_edit.text().strip(),
+            "model_path": self._model_edit.text().strip(),
         }
 
         self._worker = PipelineWorker(cfg)

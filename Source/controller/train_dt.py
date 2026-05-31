@@ -235,7 +235,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--output",
-        default=str(Path(__file__).parent / "models"),
+        default=str(Path(__file__).resolve().parent / "models"),
         help="Output directory for .joblib files",
     )
     p.add_argument(
