@@ -24,6 +24,16 @@ def compute_reward(
     return float(np.clip(reward, -2.0, 3.0))
 
 
+def compute_reward_image(
+    result: EpisodeResult,
+    target_latency_ms: float = 50.0,
+) -> float:
+    """Reward for independent images — omits track_consistency / flicker_rate."""
+    quality = result.mean_confidence * 2.0
+    cost_penalty = max(0.0, (result.latency_ms - target_latency_ms) / 100.0)
+    return float(np.clip(quality - cost_penalty, -1.0, 2.0))
+
+
 class WindowMetrics:
     """Accumulates per-frame data within a window and computes EpisodeResult."""
 

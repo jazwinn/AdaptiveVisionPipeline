@@ -23,7 +23,7 @@ from ..pipelines.pipeline_c import PipelineC
 from ..pipelines.pipeline_d import PipelineD
 from ..features.extractor import FeatureExtractor
 from ..tracking.tracker import TrackerWrapper
-from ..evaluation.metrics import WindowMetrics, compute_reward
+from ..evaluation.metrics import WindowMetrics, compute_reward, compute_reward_image
 from ..controller.orchestrator import PipelineOrchestrator
 from ..controller.base import MetaController
 from ..controller.rule_based import RuleBasedController
@@ -207,6 +207,7 @@ def run_controller(
         controller, pipelines, window_size=window_size,
         runtime_config=RuntimeConfig(mode="offline"),
     )
+    is_image_mode = reader.source_type in ("image", "directory")
 
     rewards: list[float] = []
     latencies: list[float] = []
@@ -225,9 +226,10 @@ def run_controller(
         window_metrics.update(tracked, meta["latency_ms"])
         latencies.append(meta["latency_ms"])
 
-        if (frame.index + 1) % window_size == 0:
+        at_boundary = is_image_mode or ((frame.index + 1) % window_size == 0)
+        if at_boundary:
             episode = window_metrics.compute(orchestrator.current_pipeline_name)
-            reward = compute_reward(episode)
+            reward = compute_reward_image(episode) if is_image_mode else compute_reward(episode)
             rewards.append(reward)
 
             # Track pipeline usage
@@ -251,6 +253,9 @@ def run_controller(
                 orchestrator.feature_buffer[-1] if orchestrator.feature_buffer else None,
             )
             window_metrics.reset()
+            if is_image_mode:
+                extractor.reset()
+                tracker.reset()
 
     reader.release()
     n_windows = len(rewards)

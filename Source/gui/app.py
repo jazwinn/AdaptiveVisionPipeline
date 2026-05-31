@@ -26,12 +26,14 @@ from ..controller.neural_net import NeuralNetController
 from ..controller.neural_rl import NeuralRLController
 from ..controller.none import NoneController
 from ..controller.orchestrator import PipelineOrchestrator
-from ..evaluation.metrics import WindowMetrics, compute_reward
+from ..evaluation.metrics import WindowMetrics, compute_reward, compute_reward_image
 from ..evaluation.replay_buffer import ReplayBuffer
 from ..evaluation.benchmark import (
     BenchmarkResult, PerWindowRecord,
     build_pipelines, build_controllers, run_controller, write_csv,
 )
+from ..evaluation.validate import run_validation
+from ..evaluation.pipeline_eval import run_pipeline_comparison, run_controller_comparison
 from ..experiments.logger import ExperimentLogger
 
 import cv2
@@ -42,8 +44,8 @@ from PyQt5.QtGui import QImage, QPixmap, QPalette, QColor
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QProgressBar, QRadioButton, QSizePolicy, QSlider, QSpinBox,
-    QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QButtonGroup, QProgressBar, QRadioButton, QSizePolicy, QSlider, QSpinBox,
+    QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget, QFrame,
 )
 
@@ -166,6 +168,7 @@ class PipelineWorker(QThread):
         )
         if reader.source_type in ("image", "directory") and mode == "realtime":
             mode = "offline"
+        is_image_mode = reader.source_type in ("image", "directory")
 
         runtime_cfg = RuntimeConfig(mode=mode, target_fps=cfg["target_fps"])
         orchestrator = PipelineOrchestrator(
@@ -223,9 +226,13 @@ class PipelineWorker(QThread):
                 window_metrics.update(tracked, meta["latency_ms"])
                 latency_history.append(meta["latency_ms"])
 
-                if (frame.index + 1) % cfg["window"] == 0:
+                at_boundary = is_image_mode or ((frame.index + 1) % cfg["window"] == 0)
+                if at_boundary:
                     episode = window_metrics.compute(orchestrator.current_pipeline_name)
-                    last_reward = compute_reward(episode)
+                    last_reward = (
+                        compute_reward_image(episode) if is_image_mode
+                        else compute_reward(episode)
+                    )
                     features_snap = (
                         orchestrator.feature_buffer[-1]
                         if orchestrator.feature_buffer else None
@@ -240,6 +247,9 @@ class PipelineWorker(QThread):
                             last_reward,
                         )
                     window_metrics.reset()
+                    if is_image_mode:
+                        extractor.reset()
+                        tracker.reset()
 
                 if logger:
                     logger.log_frame(
@@ -664,6 +674,610 @@ class BenchmarkWidget(QWidget):
                 item.setBackground(QColor(30, 30, 30))
 
 
+# ── Validate workers ─────────────────────────────────────────────────────────
+
+_VALIDATE_MODELS_DIR = Path(__file__).resolve().parent.parent.parent / "models"
+
+_MODE_SINGLE     = 0
+_MODE_PIPELINES  = 1
+_MODE_CONTROLLERS = 2
+
+_RUN_LABELS = ["VALIDATE MODEL", "COMPARE PIPELINES", "COMPARE CONTROLLERS"]
+
+
+class ValidateWorker(QThread):
+    """Unified worker for all three validate modes."""
+    progress = pyqtSignal(str, int)   # (status_text, pct 0-100)
+    item_done = pyqtSignal(object)    # partial result dict (pipeline/controller comparison)
+    finished  = pyqtSignal(object)    # final result (dict for single model, list for compare)
+    error     = pyqtSignal(str)
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self.cfg = cfg
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def run(self):
+        try:
+            self._run()
+        except Exception:
+            import traceback
+            self.error.emit(traceback.format_exc())
+
+    def _run(self):
+        if self._stop.is_set():
+            return
+        mode = self.cfg["mode"]
+
+        if mode == _MODE_SINGLE:
+            self.progress.emit("Validating model… (this may take a while)", 10)
+            result = run_validation(
+                model_path=self.cfg["model_path"],
+                data_yaml=self.cfg["data_yaml"],
+                split=self.cfg["split"],
+                conf=self.cfg["conf"],
+                imgsz=self.cfg["imgsz"],
+            )
+            self.progress.emit("Done", 100)
+            self.finished.emit({"mode": mode, "result": result})
+
+        elif mode == _MODE_PIPELINES:
+            selected = self.cfg["selected"]
+            n_total  = len(selected)
+
+            def cb(name, i, n):
+                if self._stop.is_set():
+                    raise InterruptedError("Stopped by user")
+                pipe_idx = selected.index(name) if name in selected else 0
+                pct = int((pipe_idx * n + i) / max(n_total * n, 1) * 100)
+                self.progress.emit(f"Evaluating {name}… image {i + 1}/{n}", pct)
+
+            results = run_pipeline_comparison(
+                data_yaml=self.cfg["data_yaml"],
+                split=self.cfg["split"],
+                conf=self.cfg["conf"],
+                model_path=self.cfg.get("model_path") or None,
+                selected_pipelines=selected,
+                progress_cb=cb,
+                result_cb=lambda r: self.item_done.emit(r),
+            )
+            self.progress.emit("Done", 100)
+            self.finished.emit({"mode": mode, "result": results})
+
+        elif mode == _MODE_CONTROLLERS:
+            selected = self.cfg["selected"]
+            n_total  = len(selected)
+
+            def cb(name, i, n):
+                if self._stop.is_set():
+                    raise InterruptedError("Stopped by user")
+                ctrl_idx = selected.index(name) if name in selected else 0
+                pct = int((ctrl_idx * n + i) / max(n_total * n, 1) * 100)
+                self.progress.emit(f"Evaluating {name}… image {i + 1}/{n}", pct)
+
+            results = run_controller_comparison(
+                data_yaml=self.cfg["data_yaml"],
+                split=self.cfg["split"],
+                conf=self.cfg["conf"],
+                model_path=self.cfg.get("model_path") or None,
+                selected_controllers=selected,
+                progress_cb=cb,
+                result_cb=lambda r: self.item_done.emit(r),
+            )
+            self.progress.emit("Done", 100)
+            self.finished.emit({"mode": mode, "result": results})
+
+
+# ── Validate widget ───────────────────────────────────────────────────────────
+
+_VAL_OVERALL_COLS  = ["Metric", "Value"]
+_VAL_CLASS_COLS    = ["Class", "AP50", "AP50-95", "Precision", "Recall"]
+_VAL_COMPARE_COLS  = ["Name", "mAP50", "mAP50-95", "Precision", "Recall", "Latency (ms)"]
+_VAL_CTRL_COLS     = ["Controller", "mAP50", "mAP50-95", "Precision", "Recall", "Latency (ms)", "Top Pipeline"]
+
+_PROG_STYLE = (
+    "QProgressBar { background: #3c3c3c; border: none; border-radius: 3px; height: 8px; }"
+    "QProgressBar::chunk { background: #4a90d9; border-radius: 3px; }"
+)
+
+
+def _styled_lbl(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setStyleSheet("color: #aaa; font-size: 11px; font-weight: bold; letter-spacing: 1px;")
+    return lbl
+
+
+class ValidateWidget(QWidget):
+    """
+    Validate tab — three modes selectable via radio buttons:
+
+    Single Model   — runs YOLO.val() on the model selected in the main panel
+    Pipelines      — runs each pipeline end-to-end on the dataset and compares mAP
+    Controllers    — lets each controller select a pipeline per image and compares mAP
+    """
+
+    def __init__(self, model_getter=None):
+        super().__init__()
+        self._model_getter = model_getter or (lambda: "")
+        self._worker: ValidateWorker | None = None
+        self._last_report: dict | None = None
+        self._build_ui()
+
+    # ── UI construction ────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self._build_left_panel())
+        root.addWidget(self._build_right_panel())
+
+    def _build_left_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setFixedWidth(220)
+        panel.setStyleSheet(_PANEL)
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(12, 14, 12, 14)
+        v.setSpacing(0)
+
+        # ── Dataset ──
+        v.addWidget(_cap("DATASET  (data.yaml)"))
+        v.addSpacing(4)
+        ds_row = QHBoxLayout()
+        ds_row.setSpacing(4)
+        self._data_edit = QLineEdit()
+        self._data_edit.setPlaceholderText("path/to/data.yaml")
+        self._data_edit.setStyleSheet(_INPUT)
+        ds_row.addWidget(self._data_edit)
+        btn_ds = QPushButton("…")
+        btn_ds.setFixedWidth(32)
+        btn_ds.setStyleSheet(_BTN_SMALL)
+        btn_ds.clicked.connect(self._on_browse_data)
+        ds_row.addWidget(btn_ds)
+        v.addLayout(ds_row)
+        v.addSpacing(10)
+
+        # ── Split ──
+        v.addWidget(_divider())
+        v.addSpacing(8)
+        split_row = QHBoxLayout()
+        split_row.addWidget(_cap("SPLIT"))
+        split_row.addStretch()
+        self._split_combo = QComboBox()
+        self._split_combo.addItems(["val", "valid", "test", "train"])
+        self._split_combo.setStyleSheet(_INPUT)
+        self._split_combo.setFixedWidth(90)
+        split_row.addWidget(self._split_combo)
+        v.addLayout(split_row)
+        v.addSpacing(10)
+
+        # ── Confidence ──
+        v.addWidget(_divider())
+        v.addSpacing(8)
+        self._conf_cap = _cap("CONFIDENCE  0.25")
+        v.addWidget(self._conf_cap)
+        v.addSpacing(4)
+        self._conf_slider = QSlider(Qt.Horizontal)
+        self._conf_slider.setRange(5, 95)
+        self._conf_slider.setValue(25)
+        self._conf_slider.setStyleSheet(_SLIDER)
+        self._conf_slider.valueChanged.connect(
+            lambda val: self._conf_cap.setText(f"CONFIDENCE  {val / 100:.2f}")
+        )
+        v.addWidget(self._conf_slider)
+        v.addSpacing(10)
+
+        # ── Image size ──
+        v.addWidget(_divider())
+        v.addSpacing(8)
+        sz_row = QHBoxLayout()
+        sz_row.addWidget(_cap("IMAGE SIZE"))
+        sz_row.addStretch()
+        self._imgsz_spin = QSpinBox()
+        self._imgsz_spin.setRange(32, 1280)
+        self._imgsz_spin.setSingleStep(32)
+        self._imgsz_spin.setValue(640)
+        self._imgsz_spin.setStyleSheet(_INPUT)
+        self._imgsz_spin.setFixedWidth(70)
+        sz_row.addWidget(self._imgsz_spin)
+        v.addLayout(sz_row)
+        v.addSpacing(10)
+
+        # ── Mode ──
+        v.addWidget(_divider())
+        v.addSpacing(8)
+        v.addWidget(_cap("MODE"))
+        v.addSpacing(4)
+        self._rb_single = QRadioButton("Single Model")
+        self._rb_pipelines = QRadioButton("Pipelines")
+        self._rb_controllers = QRadioButton("Controllers")
+        self._rb_single.setChecked(True)
+        for rb in (self._rb_single, self._rb_pipelines, self._rb_controllers):
+            rb.setStyleSheet(_RADIO)
+            v.addWidget(rb)
+        self._mode_grp = QButtonGroup(self)
+        self._mode_grp.addButton(self._rb_single,      _MODE_SINGLE)
+        self._mode_grp.addButton(self._rb_pipelines,   _MODE_PIPELINES)
+        self._mode_grp.addButton(self._rb_controllers, _MODE_CONTROLLERS)
+        self._mode_grp.buttonClicked.connect(self._on_mode_changed)
+        v.addSpacing(8)
+
+        # ── Mode-specific options (stacked) ──
+        self._opts_stack = QStackedWidget()
+        self._opts_stack.addWidget(self._build_opts_single())
+        self._opts_stack.addWidget(self._build_opts_pipelines())
+        self._opts_stack.addWidget(self._build_opts_controllers())
+        v.addWidget(self._opts_stack)
+        v.addSpacing(10)
+
+        # ── Buttons ──
+        v.addWidget(_divider())
+        v.addSpacing(8)
+        self._run_btn = QPushButton(_RUN_LABELS[_MODE_SINGLE])
+        self._run_btn.setStyleSheet(_BTN_START)
+        self._run_btn.clicked.connect(self._on_run)
+        v.addWidget(self._run_btn)
+        v.addSpacing(5)
+        self._stop_btn = QPushButton("STOP")
+        self._stop_btn.setStyleSheet(_BTN_STOP)
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.clicked.connect(self._on_stop)
+        v.addWidget(self._stop_btn)
+        v.addSpacing(5)
+        self._save_btn = QPushButton("SAVE REPORT")
+        self._save_btn.setStyleSheet(_BTN_SMALL)
+        self._save_btn.setEnabled(False)
+        self._save_btn.clicked.connect(self._on_save_report)
+        v.addWidget(self._save_btn)
+        v.addSpacing(8)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(False)
+        self._progress_bar.setStyleSheet(_PROG_STYLE)
+        v.addWidget(self._progress_bar)
+        v.addSpacing(4)
+
+        self._status_lbl = QLabel("Ready")
+        self._status_lbl.setStyleSheet("color: #888; font-size: 11px;")
+        self._status_lbl.setWordWrap(True)
+        v.addWidget(self._status_lbl)
+
+        v.addStretch()
+        return panel
+
+    def _build_opts_single(self) -> QWidget:
+        """No extra controls for single-model mode."""
+        w = QWidget()
+        lbl = QLabel("Model path taken from\nthe main panel MODEL field.")
+        lbl.setStyleSheet("color: #666; font-size: 10px;")
+        lbl.setWordWrap(True)
+        QVBoxLayout(w).addWidget(lbl)
+        return w
+
+    def _build_opts_pipelines(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        v.addWidget(_cap("PIPELINES"))
+        v.addSpacing(2)
+        self._pipe_chks: dict[str, QCheckBox] = {}
+        defaults = {"fast_baseline": True, "clahe_pipeline": True,
+                    "tiled": True, "high_res": False}
+        for name, checked in defaults.items():
+            chk = QCheckBox(name)
+            chk.setChecked(checked)
+            chk.setStyleSheet(_CHECK)
+            v.addWidget(chk)
+            self._pipe_chks[name] = chk
+        return w
+
+    def _build_opts_controllers(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        v.addWidget(_cap("CONTROLLERS"))
+        v.addSpacing(2)
+        self._ctrl_chks: dict[str, QCheckBox] = {}
+        defaults = {"none": False, "rule": True, "ucb": True, "contextual": True,
+                    "decision_tree": True, "random_forest": True,
+                    "neural_net": True, "neural_rl": True}
+        for name, checked in defaults.items():
+            chk = QCheckBox(name)
+            chk.setChecked(checked)
+            chk.setStyleSheet(_CHECK)
+            v.addWidget(chk)
+            self._ctrl_chks[name] = chk
+        return w
+
+    def _build_right_panel(self) -> QWidget:
+        right = QWidget()
+        right.setStyleSheet("background-color: #1a1a1a;")
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(10, 10, 10, 10)
+        rv.setSpacing(6)
+
+        self._right_stack = QStackedWidget()
+        self._right_stack.addWidget(self._build_single_results())
+        self._right_stack.addWidget(self._build_compare_results("Pipeline"))
+        self._right_stack.addWidget(self._build_compare_results("Controller"))
+        rv.addWidget(self._right_stack)
+        return right
+
+    def _build_single_results(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+        v.addWidget(_styled_lbl("Overall Metrics"))
+        self._overall_table = QTableWidget(4, 2)
+        self._overall_table.setHorizontalHeaderLabels(_VAL_OVERALL_COLS)
+        self._overall_table.setStyleSheet(_TBL_STYLE)
+        self._overall_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._overall_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._overall_table.horizontalHeader().setStretchLastSection(True)
+        self._overall_table.verticalHeader().setVisible(False)
+        self._overall_table.setMaximumHeight(130)
+        for row, name in enumerate(["mAP50", "mAP50-95", "Precision", "Recall"]):
+            it = QTableWidgetItem(name)
+            it.setTextAlignment(Qt.AlignCenter)
+            self._overall_table.setItem(row, 0, it)
+            vit = QTableWidgetItem("—")
+            vit.setTextAlignment(Qt.AlignCenter)
+            self._overall_table.setItem(row, 1, vit)
+        v.addWidget(self._overall_table)
+        v.addWidget(_styled_lbl("Per-Class Results"))
+        self._class_table = QTableWidget(0, len(_VAL_CLASS_COLS))
+        self._class_table.setHorizontalHeaderLabels(_VAL_CLASS_COLS)
+        self._class_table.setStyleSheet(_TBL_STYLE)
+        self._class_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._class_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._class_table.horizontalHeader().setStretchLastSection(True)
+        self._class_table.verticalHeader().setVisible(False)
+        v.addWidget(self._class_table, stretch=1)
+        self._speed_lbl = QLabel("")
+        self._speed_lbl.setStyleSheet("color: #666; font-size: 11px; padding: 2px 0;")
+        v.addWidget(self._speed_lbl)
+        return w
+
+    def _build_compare_results(self, kind: str) -> QWidget:
+        """Shared layout for pipeline and controller comparison tables."""
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+        cols = _VAL_CTRL_COLS if kind == "Controller" else _VAL_COMPARE_COLS
+        v.addWidget(_styled_lbl(f"{kind} Comparison"))
+        tbl = QTableWidget(0, len(cols))
+        tbl.setHorizontalHeaderLabels(cols)
+        tbl.setStyleSheet(_TBL_STYLE)
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        tbl.horizontalHeader().setStretchLastSection(True)
+        tbl.verticalHeader().setVisible(False)
+        v.addWidget(tbl, stretch=1)
+        if kind == "Pipeline":
+            self._pipe_cmp_table = tbl
+        else:
+            self._ctrl_cmp_table = tbl
+        return w
+
+    # ── Slots ──────────────────────────────────────────────────────────────────
+
+    def _on_mode_changed(self, btn):
+        mode = self._mode_grp.id(btn)
+        self._opts_stack.setCurrentIndex(mode)
+        self._right_stack.setCurrentIndex(mode)
+        self._run_btn.setText(_RUN_LABELS[mode])
+        self._save_btn.setEnabled(False)
+
+    def _on_browse_data(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select data.yaml", "",
+            "YAML files (*.yaml *.yml);;All files (*)",
+        )
+        if path:
+            self._data_edit.setText(path)
+
+    def _current_mode(self) -> int:
+        return self._mode_grp.checkedId()
+
+    def _on_run(self):
+        data_yaml = self._data_edit.text().strip()
+        if not data_yaml:
+            QMessageBox.warning(self, "No dataset", "Select a data.yaml file first.")
+            return
+
+        mode = self._current_mode()
+        model_path = self._model_getter().strip() or str(_VALIDATE_MODELS_DIR / "yolov8n.pt")
+
+        cfg: dict = {
+            "mode":       mode,
+            "data_yaml":  data_yaml,
+            "split":      self._split_combo.currentText(),
+            "conf":       self._conf_slider.value() / 100.0,
+            "imgsz":      self._imgsz_spin.value(),
+            "model_path": model_path,
+        }
+
+        if mode == _MODE_SINGLE:
+            # reset single-model display
+            for row in range(self._overall_table.rowCount()):
+                self._overall_table.item(row, 1).setText("—")
+            self._class_table.setRowCount(0)
+            self._speed_lbl.setText("")
+        elif mode == _MODE_PIPELINES:
+            selected = [n for n, c in self._pipe_chks.items() if c.isChecked()]
+            if not selected:
+                QMessageBox.warning(self, "No pipelines", "Select at least one pipeline.")
+                return
+            cfg["selected"] = selected
+            self._pipe_cmp_table.setRowCount(0)
+        elif mode == _MODE_CONTROLLERS:
+            selected = [n for n, c in self._ctrl_chks.items() if c.isChecked()]
+            if not selected:
+                QMessageBox.warning(self, "No controllers", "Select at least one controller.")
+                return
+            cfg["selected"] = selected
+            self._ctrl_cmp_table.setRowCount(0)
+
+        self._last_report = None
+        self._save_btn.setEnabled(False)
+        self._worker = ValidateWorker(cfg)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.item_done.connect(self._on_item_done)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+        self._run_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setVisible(True)
+        self._status_lbl.setText("Starting…")
+
+    def _on_stop(self):
+        if self._worker:
+            self._worker.stop()
+        self._stop_btn.setEnabled(False)
+        self._status_lbl.setText("Stopping…")
+
+    def _on_progress(self, text: str, pct: int):
+        self._status_lbl.setText(text)
+        self._progress_bar.setValue(pct)
+
+    def _on_item_done(self, result: dict):
+        """Populate a row as each pipeline/controller finishes."""
+        if "pipeline_name" in result:
+            self._add_compare_row(self._pipe_cmp_table, result, kind="pipeline")
+            self._colour_best(self._pipe_cmp_table, col=1)
+        elif "controller_name" in result:
+            self._add_compare_row(self._ctrl_cmp_table, result, kind="controller")
+            self._colour_best(self._ctrl_cmp_table, col=1)
+
+    def _on_finished(self, payload: dict):
+        mode   = payload["mode"]
+        result = payload["result"]
+        self._last_report = payload
+        self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._progress_bar.setVisible(False)
+        self._save_btn.setEnabled(True)
+
+        if mode == _MODE_SINGLE:
+            vals = [result["map50"], result["map"], result["precision"], result["recall"]]
+            for row, v in enumerate(vals):
+                self._overall_table.item(row, 1).setText(f"{v:.4f}  ({v * 100:.1f}%)")
+            self._class_table.setRowCount(0)
+            per_class = result.get("per_class", [])
+            best_ap50 = max((c["ap50"] for c in per_class), default=0.0)
+            for cls in per_class:
+                row = self._class_table.rowCount()
+                self._class_table.insertRow(row)
+                for col, val in enumerate([
+                    cls["class"],
+                    f"{cls['ap50']:.4f}", f"{cls['ap']:.4f}",
+                    f"{cls['precision']:.4f}", f"{cls['recall']:.4f}",
+                ]):
+                    it = QTableWidgetItem(val)
+                    it.setTextAlignment(Qt.AlignCenter)
+                    self._class_table.setItem(row, col, it)
+                if cls["ap50"] == best_ap50 and len(per_class) > 1:
+                    for col in range(len(_VAL_CLASS_COLS)):
+                        it = self._class_table.item(row, col)
+                        if it:
+                            it.setBackground(QColor(40, 90, 50))
+            spd = result.get("speed", {})
+            self._speed_lbl.setText(
+                f"Preprocess: {spd.get('preprocess', 0):.1f} ms  |  "
+                f"Inference: {spd.get('inference', 0):.1f} ms  |  "
+                f"Postprocess: {spd.get('postprocess', 0):.1f} ms"
+            )
+            self._status_lbl.setText(f"Done — {result.get('n_classes', 0)} class(es).")
+
+        elif mode == _MODE_PIPELINES:
+            self._status_lbl.setText(f"Done — {len(result)} pipeline(s) evaluated.")
+
+        elif mode == _MODE_CONTROLLERS:
+            self._status_lbl.setText(f"Done — {len(result)} controller(s) evaluated.")
+
+    def _on_error(self, msg: str):
+        self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        self._progress_bar.setVisible(False)
+        QMessageBox.critical(self, "Evaluation error", msg)
+
+    def _on_save_report(self):
+        if not self._last_report:
+            return
+        import json
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save report", "", "JSON (*.json);;All (*)"
+        )
+        if path:
+            with open(path, "w") as f:
+                json.dump(self._last_report, f, indent=2, default=str)
+            self._status_lbl.setText(f"Saved -> {Path(path).name}")
+
+    # ── Table helpers ──────────────────────────────────────────────────────────
+
+    def _add_compare_row(self, tbl: QTableWidget, r: dict, kind: str):
+        row = tbl.rowCount()
+        tbl.insertRow(row)
+        if kind == "pipeline":
+            name = r.get("pipeline_name", "?")
+            dist = ""
+        else:
+            name = r.get("controller_name", "?")
+            dist_d = r.get("pipeline_distribution", {})
+            if dist_d:
+                top = max(dist_d, key=dist_d.get)
+                dist = f"{top} ({dist_d[top]*100:.0f}%)"
+            else:
+                dist = "—"
+
+        values = [
+            name,
+            f"{r.get('map50', 0):.4f}",
+            f"{r.get('map', 0):.4f}",
+            f"{r.get('precision', 0):.4f}",
+            f"{r.get('recall', 0):.4f}",
+            f"{r.get('mean_latency_ms', 0):.1f}",
+        ]
+        if kind == "controller":
+            values.append(dist)
+
+        for col, val in enumerate(values):
+            it = QTableWidgetItem(val)
+            it.setTextAlignment(Qt.AlignCenter)
+            tbl.setItem(row, col, it)
+
+    def _colour_best(self, tbl: QTableWidget, col: int = 1):
+        """Highlight best mAP50 row green, worst red."""
+        n = tbl.rowCount()
+        if n < 2:
+            return
+        vals = []
+        for row in range(n):
+            try:
+                vals.append(float(tbl.item(row, col).text()))
+            except (ValueError, AttributeError):
+                vals.append(0.0)
+        best, worst = max(vals), min(vals)
+        for row, v in enumerate(vals):
+            bg = QColor(40, 90, 50) if v == best else (
+                 QColor(90, 40, 40) if v == worst else QColor(30, 30, 30))
+            for c in range(tbl.columnCount()):
+                it = tbl.item(row, c)
+                if it:
+                    it.setBackground(bg)
+
+
 # ── Video display widget ──────────────────────────────────────────────────────
 
 class VideoLabel(QLabel):
@@ -719,6 +1333,10 @@ class MainWindow(QMainWindow):
                 model_getter=lambda: self._model_edit.text().strip(),
             ),
             "📊  Benchmark",
+        )
+        tabs.addTab(
+            ValidateWidget(model_getter=lambda: self._model_edit.text().strip()),
+            "🎯  Validate",
         )
         root.addWidget(tabs)
 
