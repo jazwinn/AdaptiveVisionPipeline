@@ -9,7 +9,6 @@ venv/
 # Model weights (large files — download separately)
 *.pt
 *.pth
-*.onnx
 
 # Experiment outputs
 experiments/
