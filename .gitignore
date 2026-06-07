@@ -25,3 +25,5 @@ test_image.*
 # OS
 Thumbs.db
 .DS_Store
+video/
+image/

@@ -3,7 +3,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from ..core.pipeline import DetectionPipeline, Detection
+from ..core.pipeline import DetectionPipeline, Detection, yolo_results_to_detections
 
 _MODELS_DIR = Path(__file__).resolve().parent.parent.parent / "models"
 
@@ -40,12 +40,4 @@ class PipelineE(DetectionPipeline):
 
     def infer(self, image: np.ndarray) -> list[Detection]:
         results = self.model(image, imgsz=self.imgsz, conf=self.conf, verbose=False)[0]
-        detections = []
-        for box in results.boxes:
-            detections.append(Detection(
-                bbox_xyxy=box.xyxy.cpu().numpy()[0],
-                confidence=float(box.conf),
-                class_id=int(box.cls),
-                class_name=results.names[int(box.cls)],
-            ))
-        return detections
+        return yolo_results_to_detections(results)

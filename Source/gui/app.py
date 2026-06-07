@@ -219,8 +219,9 @@ class PipelineWorker(QThread):
         extractor = FeatureExtractor()
         tracker = TrackerWrapper()
         window_metrics = WindowMetrics()
-        box_annotator = sv.BoxAnnotator()
+        box_annotator   = sv.BoxAnnotator()
         label_annotator = sv.LabelAnnotator()
+        mask_annotator  = sv.MaskAnnotator(opacity=0.45)
         latency_history: deque[float] = deque(maxlen=30)
         last_reward = 0.0
 
@@ -319,22 +320,40 @@ class PipelineWorker(QThread):
 
                 annotated = frame.image.copy()
                 if tracked:
+                    has_masks = any(t.mask is not None for t in tracked)
+                    if has_masks:
+                        fh, fw = annotated.shape[:2]
+                        mask_arr = np.zeros((len(tracked), fh, fw), dtype=bool)
+                        for mi, t in enumerate(tracked):
+                            if t.mask is not None:
+                                mh, mw = t.mask.shape
+                                mask_arr[mi, :mh, :mw] = t.mask
+                    else:
+                        mask_arr = None
+
                     sv_dets = sv.Detections(
                         xyxy=np.array([t.bbox_xyxy for t in tracked]),
                         confidence=np.array([t.confidence for t in tracked]),
                         class_id=np.array([t.class_id for t in tracked]),
+                        mask=mask_arr,
                     )
                     labels = [
                         f"#{t.track_id} {t.class_name} {t.confidence:.2f}"
                         for t in tracked
                     ]
-                    annotated = box_annotator.annotate(annotated, sv_dets)
+                    if has_masks:
+                        annotated = mask_annotator.annotate(annotated, sv_dets)
+                    else:
+                        annotated = box_annotator.annotate(annotated, sv_dets)
                     annotated = label_annotator.annotate(annotated, sv_dets, labels=labels)
                 else:
                     sv_dets = sv.Detections.empty()
+                    has_masks = False
+
+                seg_tag = " [SEG]" if has_masks else ""
                 cv2.putText(
                     annotated,
-                    f"{meta['selected_pipeline']} | {meta['latency_ms']:.0f}ms"
+                    f"{meta['selected_pipeline']}{seg_tag} | {meta['latency_ms']:.0f}ms"
                     f" | r={last_reward:.2f}",
                     (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2,
                 )
@@ -1375,21 +1394,168 @@ class ValidateWidget(QWidget):
 # ── Video display widget ──────────────────────────────────────────────────────
 
 class VideoLabel(QLabel):
+    """
+    Video/image display with interactive pan & zoom.
+
+    Controls
+    --------
+    Scroll wheel        — zoom in / out (centred on cursor)
+    Left-button drag    — pan when zoomed in
+    Double-click        — reset zoom to fit-to-window
+    """
+
     def __init__(self):
         super().__init__("Configure settings on the left, then press  START")
         self.setAlignment(Qt.AlignCenter)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setMinimumSize(480, 360)
         self.setStyleSheet("background-color: #111111; color: #555555; font-size: 14px;")
+        self.setMouseTracking(True)
 
-    def update_frame(self, img: np.ndarray):
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qt_img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        self._raw_frame: np.ndarray | None = None
+        self._zoom: float = 1.0          # 1.0 = fit to widget
+        self._pan: list[float] = [0.5, 0.5]   # normalised centre (0-1)
+        self._drag_start: tuple | None = None  # (QPoint, [pan_x, pan_y])
+
+    # ── public ────────────────────────────────────────────────────────────
+
+    def update_frame(self, img: np.ndarray) -> None:
+        self._raw_frame = img
+        self._render()
+
+    # ── internal rendering ────────────────────────────────────────────────
+
+    def _render(self) -> None:
+        if self._raw_frame is None:
+            return
+        img = self._raw_frame
+        fh, fw = img.shape[:2]
+
+        if self._zoom <= 1.0:
+            crop = img
+        else:
+            # Viewport size in original image pixels
+            vw = fw / self._zoom
+            vh = fh / self._zoom
+            # Top-left corner of viewport
+            cx, cy = self._pan[0] * fw, self._pan[1] * fh
+            x1 = int(max(0, round(cx - vw / 2)))
+            y1 = int(max(0, round(cy - vh / 2)))
+            x2 = int(min(fw, x1 + round(vw)))
+            y2 = int(min(fh, y1 + round(vh)))
+            # Clamp so viewport doesn't go out of bounds
+            if x2 - x1 < round(vw): x1 = max(0, x2 - int(round(vw)))
+            if y2 - y1 < round(vh): y1 = max(0, y2 - int(round(vh)))
+            crop = img[y1:y2, x1:x2]
+
+        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        ch2, cw2 = rgb.shape[:2]
+        qt_img = QImage(rgb.data.tobytes(), cw2, ch2, 3 * cw2, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qt_img).scaled(
             self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
         self.setPixmap(pixmap)
+
+        # Zoom level overlay
+        if self._zoom > 1.005:
+            from PyQt5.QtGui import QPainter, QFont
+            from PyQt5.QtCore import QRect
+            p = QPainter(pixmap)
+            p.setOpacity(0.75)
+            p.fillRect(QRect(pixmap.width() - 74, 6, 68, 22),
+                       QColor(0, 0, 0))
+            p.setOpacity(1.0)
+            p.setPen(QColor(0, 220, 100))
+            font = QFont("Consolas", 10, QFont.Bold)
+            p.setFont(font)
+            p.drawText(QRect(pixmap.width() - 74, 6, 68, 22),
+                       Qt.AlignCenter, f"🔍 {self._zoom:.1f}×")
+            p.end()
+            self.setPixmap(pixmap)
+
+    def _display_rect(self, fw: int, fh: int):
+        """Return (x_off, y_off, disp_w, disp_h) of the image within this widget."""
+        lw, lh = self.width(), self.height()
+        scale = min(lw / max(fw, 1), lh / max(fh, 1))
+        dw, dh = fw * scale, fh * scale
+        return (lw - dw) / 2.0, (lh - dh) / 2.0, dw, dh
+
+    def _widget_to_img_norm(self, wx: float, wy: float) -> tuple[float, float]:
+        """Map a widget pixel (wx, wy) to a normalised image coordinate (0-1, 0-1)."""
+        if self._raw_frame is None:
+            return 0.5, 0.5
+        fh, fw = self._raw_frame.shape[:2]
+        x_off, y_off, dw, dh = self._display_rect(fw, fh)
+        # Fraction within the displayed image area
+        frac_x = (wx - x_off) / max(dw, 1)
+        frac_y = (wy - y_off) / max(dh, 1)
+        # Map to original image coords via pan/zoom
+        nx = self._pan[0] + (frac_x - 0.5) / self._zoom
+        ny = self._pan[1] + (frac_y - 0.5) / self._zoom
+        return max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))
+
+    def _clamp_pan(self) -> None:
+        hw = 0.5 / self._zoom
+        self._pan[0] = max(hw, min(1.0 - hw, self._pan[0]))
+        self._pan[1] = max(hw, min(1.0 - hw, self._pan[1]))
+
+    # ── events ────────────────────────────────────────────────────────────
+
+    def wheelEvent(self, event) -> None:
+        delta = event.angleDelta().y()
+        factor = 1.18 if delta > 0 else (1.0 / 1.18)
+
+        # Image point under the cursor stays fixed after zoom
+        mx, my = event.pos().x(), event.pos().y()
+        img_nx, img_ny = self._widget_to_img_norm(mx, my)
+
+        self._zoom = max(1.0, min(12.0, self._zoom * factor))
+
+        if self._zoom > 1.0:
+            # Adjust pan so cursor-image point is preserved
+            if self._raw_frame is not None:
+                fh, fw = self._raw_frame.shape[:2]
+                x_off, y_off, dw, dh = self._display_rect(fw, fh)
+                frac_x = (mx - x_off) / max(dw, 1)
+                frac_y = (my - y_off) / max(dh, 1)
+                self._pan[0] = img_nx - (frac_x - 0.5) / self._zoom
+                self._pan[1] = img_ny - (frac_y - 0.5) / self._zoom
+            self._clamp_pan()
+        else:
+            self._pan = [0.5, 0.5]
+
+        self._render()
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton and self._zoom > 1.0:
+            self._drag_start = (event.pos(), list(self._pan))
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_start and self._raw_frame is not None:
+            start_pos, start_pan = self._drag_start
+            fh, fw = self._raw_frame.shape[:2]
+            _, _, dw, dh = self._display_rect(fw, fh)
+            # Drag offsets as fractions of the displayed image
+            ddx = (event.pos().x() - start_pos.x()) / max(dw, 1)
+            ddy = (event.pos().y() - start_pos.y()) / max(dh, 1)
+            self._pan[0] = start_pan[0] - ddx / self._zoom
+            self._pan[1] = start_pan[1] - ddy / self._zoom
+            self._clamp_pan()
+            self._render()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        """Double-click resets to fit-to-window."""
+        self._zoom = 1.0
+        self._pan = [0.5, 0.5]
+        self._render()
+        super().mouseDoubleClickEvent(event)
 
 
 # ── Main window ───────────────────────────────────────────────────────────────
